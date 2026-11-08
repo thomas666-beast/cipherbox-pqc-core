@@ -1,0 +1,21 @@
+[package]
+name = "cipherbox-pqc-core"
+version = "0.3.0"
+edition = "2024"
+authors = ["Thomas <selfworker112@mailfence.com>"]
+description = "From-scratch post-quantum cryptography core: ML-KEM-768, Keccak, chunked file encryption"
+license = "MIT"
+repository = "https://github.com/thomas666-beast/cipherbox-pqc-core"
+keywords = ["pqc", "cryptography", "post-quantum", "kyber", "ml-kem"]
+categories = ["cryptography"]
+
+[dependencies]
+getrandom = "0.2"
+ml-dsa = "=0.1.2"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+base64 = "0.22"
+
+[dev-dependencies]
+serde_json = "1.0"
+hex-literal = "0.4"

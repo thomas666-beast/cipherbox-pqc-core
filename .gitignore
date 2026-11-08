@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Library crate: do not track Cargo.lock
+Cargo.lock
+
+# cargo-fuzz runtime outputs
+fuzz/target/
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/coverage/
+
+# Test/coverage artifacts
+*.profraw
+*.profdata
