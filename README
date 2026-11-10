@@ -1,653 +1,814 @@
 ================================================================================
-                            CIPHERBOX PQC
+                          CIPHERBOX PQC CORE
 ================================================================================
 
-           From-scratch ML-KEM-768 for servers, with streaming
-                    large-file encryption and CLI tools.
+             From-scratch post-quantum cryptography for servers:
+             ML-KEM-768 / ML-KEM-1024, X25519 hybrid KEM, secret-
+             derived rooms with a forward-secure ratchet, Keccak,
+             and chunked large-file encryption.
 
-                    Version 0.3.0  |  MIT License
+                          Version 0.7.0  |  MIT License
+                          Status: KAT-validated, NOT audited.
 
 ================================================================================
   TABLE OF CONTENTS
 ================================================================================
 
-  1.  What This Project Is
-  2.  What This Project Is Not
-  3.  The From-Scratch ML-KEM
-  4.  Why "From Scratch" Matters
-  5.  ACVP Validation
-  6.  The Chunked File Format
-  7.  CLI Tools
-  8.  Library Usage
-  9.  Testing and Fuzzing
+  1.  What This Crate Is
+  2.  What Changed in 0.7.0
+  3.  What Is In This Crate
+  4.  What Is NOT In This Crate
+  5.  Module Reference
+  6.  Hybrid KEM Construction
+  7.  Room Protocol
+  8.  File Format
+  9.  Testing and Validation
  10.  Security Model and Honest Limitations
- 11.  Relationship to Other PQC Projects
+ 11. Comparison to RustCrypto and Other Projects
  12.  Building
- 13.  License
+ 13.  Dependencies
+ 14.  License
 
 
 ================================================================================
-  1.  WHAT THIS PROJECT IS
+  1.  WHAT THIS CRATE IS
 ================================================================================
 
-Cipherbox PQC is a Rust workspace with three crates:
+A single Rust crate that provides, for server-side use:
 
-  cipherbox-pqc-core
-      A from-scratch implementation of ML-KEM-768 (FIPS 203),
-      including Keccak-f[1600], the field arithmetic mod 3329, the
-      NTT, CBD sampling, byte encoding, the IND-CPA PKE, and the
-      Fujisaki-Okamoto IND-CCA transform. It also provides a
-      streaming, chunked file-encryption format built on top of
-      the KEM.
+  - A from-scratch implementation of ML-KEM-768 and ML-KEM-1024
+    (FIPS 203), including Keccak, field arithmetic, NTT, CBD
+    sampling, byte encoding, the IND-CPA PKE, the IND-CCA KEM,
+    and the FIPS 203 section 7.2 / 7.3 key-validation routines.
 
-  cipherbox-pqc-native
-      A thin re-export of the core crate plus five CLI binaries:
-      keygen, file-encrypt, file-decrypt, verify (ML-DSA), and
-      wrap (room-key wrapping).
+  - A hybrid X25519 + ML-KEM KEM in the X-Wing style. The
+    construction is documented in full and pinned by a
+    known-answer test. It is NOT byte-compatible with X-Wing.
 
-  cipherbox-pqc-wasm
-      WebAssembly bindings for the same core crate, so browser
-      applications use the exact same ML-KEM implementation as
-      server binaries.
+  - A secret-derived "room" protocol: a group key derived from
+    passphrases or other out-of-band sources via Argon2id, with
+    a forward-secure symmetric ratchet, optional ML-DSA signatures
+    on messages, and a rekey mechanism that upgrades a room to
+    post-compromise security by wrapping fresh randomness to
+    members' KEM public keys.
 
-The single sentence that describes the project:
+  - Chunked large-file encryption using the STREAM construction,
+    with format v1 (ML-KEM-768 only) and v2 (any suite: ML-KEM-768,
+    ML-KEM-1024, or either X25519 hybrid).
 
-  A transparent, ACVP-validated, from-scratch ML-KEM-768
-  implementation for Rust, with a fully specified streaming file
-  format and ready-to-use CLI tools.
+  - ML-DSA-65 and ML-DSA-87 signatures via the RustCrypto
+    ml-dsa crate (not rewritten here).
 
-If you want to know precisely what code is doing cryptography, read
-cipherbox-pqc-core/src/. Everything is there. There is no hidden
-layer, no proprietary entropy source, no undocumented exchange.
+  - Passphrase-based encryption of arbitrary private key material
+    using Argon2id + ChaCha20-Poly1305, with a versioned blob
+    format that authenticates its own KDF parameters.
 
+  - Key wrapping: encapsulate to a recipient's public key, derive
+    a domain-separated AEAD key, encrypt a payload, return a
+    self-describing binary blob or a JSON structure.
 
-================================================================================
-  2.  WHAT THIS PROJECT IS NOT
-================================================================================
-
-This is not a chat application, a VPN, a messaging product, or a
-collaboration platform. It does not implement a network protocol.
-
-This is not a drop-in replacement for OpenSSL or libsodium. It does
-not attempt to solve key distribution, certificate management, or
-protocol negotiation. Those are separate problems that require
-separate engineering.
-
-This is not an audited implementation. The code has been validated
-against the official NIST ACVP test vectors and fuzzed, but it has
-not been through an independent third-party security audit. If your
-threat model requires an audit, use a library that has been audited
-or wait for one that will be.
-
-This is not a complete post-quantum stack. It provides ML-KEM-768.
-It does not provide ML-DSA from scratch (that still comes from the
-ml-dsa RustCrypto crate), ML-KEM-1024, FrodoKEM, or other PQC
-primitives. Adding those is a future direction, not a current
-feature.
-
-What this project *is*: a building block. You can use it as the
-KEM inside a larger system, as a reference implementation for
-understanding ML-KEM, as a CLI for encrypting files at rest with a
-post-quantum key, or as an ACVP-conformant code base to fork and
-modify.
+The crate is #![forbid(unsafe_code)]. Every key material type
+implements Drop and zeroizes on drop. Sensitive intermediates are
+zeroized after use in the functions that produce them.
 
 
 ================================================================================
-  3.  THE FROM-SCRATCH ML-KEM
+  2.  WHAT CHANGED IN 0.7.0
 ================================================================================
 
-The ML-KEM implementation in cipherbox-pqc-core is written against
-FIPS 203 directly. No external KEM crate is used. The dependency
-list is deliberately small:
+This release doubles the scope of the crate relative to 0.3.0. The
+changes are additive - no public API that existed in 0.3.0 was
+removed or changed in a breaking way - but they are substantial
+enough that a reader who last saw 0.3.0 needs a map.
 
-  ml-dsa 0.1.2          ML-DSA (Dilithium) signatures. Not rewritten.
-  chacha20poly1305 0.10 AEAD primitive for symmetric encryption.
-  argon2 0.5            Passphrase KDF.
-  base64 0.22           Encoding only.
-  getrandom 0.2         OS entropy only.
+NEW IN 0.7.0
 
-Everything in the ML-KEM algorithm is our own code:
+  - ML-KEM-1024 support. The KEM is now generic over the parameter
+    set. params::KemLevel enumerates both levels with their FIPS
+    203 sizes; kem::*_level functions take a level argument;
+    MlKemKeyPair::new_with_level and from_seed_with_level produce
+    either level.
 
-  keccak.rs  ~350 lines
+  - FIPS 203 section 7.2 / 7.3 key validation.
+    kem::check_ek_level rejects encapsulation keys whose
+    coefficients are not all below q.
+    kem::check_dk_level additionally verifies the stored hash
+    H(ek) against the embedded ek. Both are exposed through
+    validate_encapsulation_key and are called by encapsulate_to,
+    FileDecryptor::new, and wrap_room_key_for_user.
+
+  - X25519 + ML-KEM hybrid KEM (hybrid module). Domain-separated
+    seed expansion, transcript-bound combiner, low-order X25519
+    point rejection on the sender side. Pinned by a Python-model
+    KAT.
+
+  - Secret-derived rooms (room module). Argon2id-stretched
+    sources -> root -> room id, auth token, epoch 0 key.
+    Per-sender hash chains with a bounded skip window. Optional
+    ML-DSA signatures on messages and on rekey bundles. Rekey
+    injects fresh randomness wrapped to members' KEM public keys,
+    so a leaked passphrase does not compromise future epochs.
+
+  - File format v2. Records the suite id in the header so that
+    ML-KEM-1024 and hybrid files are distinguishable from the
+    original ML-KEM-768-only format. Files encrypted to
+    ML-KEM-768 keys are still written as v1, so older readers
+    keep working.
+
+  - Passphrase blob v2. The Argon2id parameters are stored in
+    the header and authenticated as AAD, so an attacker cannot
+    weaken them by tampering. Legacy v1 blobs (with default
+    parameters and no header) are still accepted on decrypt.
+
+  - Room key wrapping v2. The wrapped-key AEAD key is now derived
+    by hashing the KEM ciphertext, the recipient public key, and
+    the shared secret with a domain separator. v1 blobs (raw
+    shared secret as AEAD key) can still be opened.
+
+  - Zeroization throughout. All key material types, all
+    intermediates that contain key material, and all decrypted
+    buffers are zeroized on drop or after use.
+
+  - KAT files and independent models. See section 9.
+
+BEHAVIOUR CHANGES THAT MAY AFFECT CALLERS
+
+  - wrap_room_key_for_user now emits {"v":2,...} and the ciphertext
+    is bound to the recipient's public key. Old v1 JSON can be
+    decrypted by passing version = 1 to unwrap_room_key.
+
+  - MlKemKeyPair::import_keys now rejects an ek that does not match
+    the dk_seed, rather than accepting any well-formed ek.
+
+  - FileDecryptor::new rejects a decapsulation key whose embedded
+    hash does not match. This is a correctness check, not a
+    performance check.
+
+  - The CipherboxError type is unchanged in shape. New error
+    strings appear for the new checks.
+
+
+================================================================================
+  3.  WHAT IS IN THIS CRATE
+================================================================================
+
+WRITTEN FROM SCRATCH IN THIS CRATE
+
+  keccak.rs
       Keccak-f[1600] permutation. SHA3-256, SHA3-512, SHAKE-128,
-      SHAKE-256. Implemented from the FIPS 202 specification.
-      Tested against NIST's published KAT vectors for each function.
+      SHAKE-256. Tested against NIST-published vectors and
+      against Python's hashlib.
 
-  field.rs  ~200 lines
-      Field arithmetic modulo q = 3329. Montgomery multiplication
-      with R = 2^16. Constant-time addition, subtraction,
-      multiplication, negation, and equality. QINV (the Montgomery
-      inverse constant) is derived by a compile-time brute-force
-      search rather than a hand-written constant, removing any risk
-      of transcription errors.
+  field.rs
+      Field arithmetic modulo q = 3329. Montgomery
+      multiplication with R = 2^16. QINV is derived at compile
+      time by brute-force search for the value satisfying
+      (candidate * q) & 0xFFFF == 1, so no transcription error
+      is possible.
 
-  ntt.rs  ~150 lines
-      The 7-layer NTT and inverse NTT for Kyber-768. Zetas table
-      is generated at compile time by computing ζ^bitrev7(k) and
-      converting to Montgomery form, so the constants are provably
-      correct.
+  ntt.rs
+      The 7-layer NTT and inverse NTT. Zetas table is computed at
+      compile time from zeta = 17 and the bit-reversal permutation,
+      so the constants are provably correct.
 
-  poly.rs  ~300 lines
-      CBD sampling (η = 2), compress/decompress for d = 1, 4, 10,
-      12, and byte encoding for 12-bit, 10-bit, 4-bit, and 1-bit
-      polynomials. Every routine has round-trip tests including
-      boundary values (all-zeros, all-ones, all-0xFFF, etc.).
+  poly.rs
+      CBD sampling for eta = 2.
+      Compression for d = 1, 4, 10, 11, 12.
+      Byte encoding for the same widths.
+      Division by q is implemented as multiply-and-shift (the
+      KyberSlash mitigation); the exactness of the constant is
+      exhaustively tested for every d in [1, 12] and every x
+      in [0, q).
 
-  pke.rs  ~250 lines
-      IND-CPA public-key encryption: K-PKE.KeyGen, K-PKE.Encrypt,
-      K-PKE.Decrypt per Algorithms 13, 14, and 15. Uses all the
-      above.
+  pke.rs
+      IND-CPA PKE (K-PKE.KeyGen / Encrypt / Decrypt).
+      Generic over the parameter set.
 
-  kem.rs  ~130 lines
-      IND-CCA key encapsulation: ML-KEM.KeyGen, ML-KEM.Encaps,
-      ML-KEM.Decaps per Algorithms 16, 17, and 18. Implements the
-      Fujisaki-Okamoto transform with implicit rejection: an
-      invalid ciphertext produces a deterministic pseudorandom
-      shared secret derived from J(z || c), never a decryption
-      failure.
+  kem.rs
+      IND-CCA KEM (ML-KEM.KeyGen / Encaps / Decaps).
+      Fujisaki-Okamoto transform with implicit rejection.
+      FIPS 203 section 7.2 and 7.3 key checks.
+      Generic over the parameter set; fixed-size ML-KEM-768
+      wrappers preserved for compatibility.
 
-  file.rs  ~450 lines
-      The chunked file encryption format. See section 6.
+  params.rs
+      Parameter-set and suite descriptors, with sizes that match
+      FIPS 203 Table 2 and are checked by test.
 
-Total: approximately 1,830 lines of new cryptographic code in
-cipherbox-pqc-core/src/. Everything below the "AEAD primitive" line
-— ChaCha20-Poly1305, Argon2, and ML-DSA — is a dependency, and that
-line is where we are honest about what is ours and what is not.
+  hybrid.rs
+      X25519 + ML-KEM hybrid KEM. See section 6.
 
+  file.rs
+      Chunked file encryption (STREAM). See section 8.
 
-================================================================================
-  4.  WHY "FROM SCRATCH" MATTERS
-================================================================================
+  room.rs
+      Secret-derived rooms with a forward-secure ratchet.
+      See section 7.
 
-Every language ecosystem already has ML-KEM libraries. The RustCrypto
-ml-kem crate is well-maintained, security-assessed, and used in
-production. Why write another one?
+  lib.rs
+      Public API surface: MlKemKeyPair, MlDsaKeyPair,
+      MlDsa87KeyPair, HybridKeyPair, Decapsulator trait,
+      passphrase encryption, key wrapping, room re-exports.
 
-Because the criticism of every wrapper library is the same: "I can
-just use ml-kem directly; I do not need your wrapper." That
-criticism is correct. A wrapper that adds nothing but an API is a
-wrapper that adds nothing.
+PROVIDED BY DEPENDENCIES, NOT REWRITTEN
 
-A from-scratch implementation is a different kind of artifact. It is
-auditable at the algorithm level. If you want to understand how the
-NTT works in ML-KEM-768, you can read ntt.rs. If you want to know
-why the shared secret in decapsulation is derived the way it is, you
-can read kem.rs. There is no opaque dependency between the spec and
-the behavior. The code IS the spec, translated into Rust.
-
-This matters for three concrete use cases:
-
-  1. Teaching and reference. If you are writing a paper, teaching a
-     course, or learning how ML-KEM works, a from-scratch
-     implementation with ACVP validation is a better reference than
-     a wrapper around an opaque library.
-
-  2. Auditability. A reviewer who wants to verify that your system
-     uses ML-KEM correctly can read the code that computes it. In a
-     wrapper, they have to trust the wrapper AND the library. In a
-     from-scratch implementation, they have to trust only the code
-     in front of them, plus their own ability to verify it against
-     the spec.
-
-  3. Forkability. If you need to modify ML-KEM (for research, for
-     a variant, for a constrained environment), you cannot modify
-     a library you do not own. You can modify code you wrote.
-
-What from-scratch does NOT buy you:
-
-  - It does not buy you an audit. An implementation is audited by
-    an independent third party, not by its author.
-  - It does not buy you constant-time guarantees beyond what the
-    code actually does. The field arithmetic is constant-time with
-    respect to input values, but the compiler can optimize in ways
-    that affect timing, and no formal verification has been done.
-  - It does not buy you a performance improvement over the
-    RustCrypto crate. Ours is probably slower.
-  - It does not buy you production readiness. The RustCrypto ml-kem
-    crate is production-ready. Ours is a reference implementation
-    that happens to pass the ACVP vectors, which is the most
-    important correctness milestone but not the only one.
-
-Use this project when the value of transparency outweighs the cost
-of writing and maintaining your own code. That is a real trade-off,
-and it is not always the right one.
+  - ML-DSA-65 and ML-DSA-87 signatures (via ml-dsa)
+  - ChaCha20-Poly1305 AEAD (via chacha20poly1305)
+  - Argon2id password hashing (via argon2)
+  - X25519 (via x25519-dalek)
+  - base64 encoding (via base64)
+  - OS entropy (via getrandom)
+  - zeroization (via zeroize)
 
 
 ================================================================================
-  5.  ACVP VALIDATION
+  4.  WHAT IS NOT IN THIS CRATE
 ================================================================================
 
-The single most important validation of a from-scratch ML-KEM
-implementation is conformance to the NIST ACVP test vectors. These
-are the same vectors that every FIPS 203 implementation is validated
-against by certification laboratories.
+  - Not audited. There has been no independent third-party
+    security audit of this crate. Do not treat it as production-
+    ready cryptography without one.
 
-The project is validated against the ML-KEM-768 vectors from the
-NIST ACVP-Server repository (v1.1.0.40):
+  - Not ACVP-validated for ML-KEM. The KEM is validated against an
+    independent OpenSSL-derived KAT and against OpenSSL-generated
+    vectors that cover the same algorithm, but the NIST ACVP test
+    vectors are not currently in tests/vectors/. Until they are
+    restored and passing, this crate does not claim ACVP
+    conformance.
 
-  ML-KEM-keyGen-FIPS203/internalProjection.json
-      25 test cases for parameter set ML-KEM-768.
-      Each case provides (d, z) and expects (ek, dk).
+  - No network protocol. This crate provides primitives and file
+    formats. It does not implement transport, framing,
+    authentication of peers, or discovery. Those belong in the
+    application that uses this crate.
 
-  ML-KEM-encapDecap-FIPS203/internalProjection.json
-      25 encapsulation cases and 10 decapsulation cases for
-      parameter set ML-KEM-768.
-      Encapsulation: given (ek, m), expects (c, k).
-      Decapsulation: given (dk, c), expects k.
-      The decapsulation cases include "modified ciphertext"
-      inputs that exercise the implicit-rejection path.
+  - No ML-DSA implementation. Signatures use the RustCrypto
+    ml-dsa crate. If your threat model requires those to be
+    from-scratch as well, this crate does not meet it.
 
-Test file: cipherbox-pqc-core/tests/acvp_kat.rs.
-Command:  cargo test acvp -- --nocapture.
+  - No X25519 implementation. The hybrid uses x25519-dalek.
 
-Expected output:
+  - No constant-time analysis. The field arithmetic is written to
+    be constant-time with respect to input values, and the
+    KyberSlash division has been removed, but no formal
+    verification has been performed and no timing measurement has
+    been done on the compiled binary. WebAssembly and JIT
+    environments are not analysed at all.
 
-  ACVP keyGen ML-KEM-768: 25 cases passed
-  ACVP encapDecap ML-KEM-768: 25 encapsulation, 10 decapsulation cases passed
-
-The test also skips the encapsulationKeyCheck and
-decapsulationKeyCheck groups, which test FIPS 203 §7.2 and §7.3 key
-validation. Those routines are not implemented (they are not part of
-the KEM algorithms 16–18) and are a separate task for the future.
-
-Passing these vectors is not the same as passing a certification
-lab. A certification lab tests the implementation, the build process,
-the documentation, and the operational environment. Passing the
-vectors is the necessary and sufficient condition for "the math is
-right." Everything else is process.
+  - No side-channel hardening beyond the above. No masking, no
+    shuffling, no blinding. If an attacker can measure fine-
+    grained timing on the machine running this crate, you are
+    outside the model this crate claims to defend.
 
 
 ================================================================================
-  6.  THE CHUNKED FILE FORMAT
+  5.  MODULE REFERENCE
 ================================================================================
 
-The file format is designed for streaming encryption of arbitrarily
-large files. The construction is the STREAM construction (Hoang,
-Reyhanitabar, Rogaway, Vizár, 2015), which is the standard way to
-apply an AEAD to a long message with chunked processing.
+MlKemKeyPair
+-------------
+  new()
+      Result<Self, CipherboxError>
+      ML-KEM-768 key pair.
 
-Header layout (all multi-byte integers are little-endian):
+  new_with_level(level: KemLevel)
+      Result<Self, CipherboxError>
+      Either ML-KEM-768 or ML-KEM-1024.
 
-  +--------+---------+--------------+-------------+
-  | magic  | version | chunk_size   | kem_ct      |
-  | 4 B    | 1 B     | 4 B (u32)    | 1088 B      |
-  +--------+---------+--------------+-------------+
+  from_seed(seed: &[u8])
+      Result<Self, CipherboxError>
+      From a 64-byte seed (d || z), ML-KEM-768.
 
-  magic       b"CBOX"
-  version     0x01
-  chunk_size  plaintext bytes per chunk (must be in [64, 1048576])
-  kem_ct      ML-KEM-768 ciphertext (1088 bytes)
+  from_seed_with_level(seed: &[u8], level: KemLevel)
+      Result<Self, CipherboxError>
+      Either level.
 
-The header is followed by one or more chunks. Each chunk is:
+  encapsulate()
+      Result<(Vec<u8>, Vec<u8>), CipherboxError>
+      Encapsulate to this key pair's own public key.
 
-  ChaCha20-Poly1305(chunk_plaintext) with:
-    key    = aead_key
-    nonce  = counter (u64 LE) || 0x00 0x00 0x00 || last_flag (1 B)
-    aad    = b"CBOX-v1-chunk"
+  decapsulate(ciphertext: &[u8])
+      Result<Vec<u8>, CipherboxError>
+      Implicit rejection on invalid ciphertext.
 
-  counter     chunk index, starting at 0
-  last_flag   0x00 for non-final chunks, 0x01 for the final chunk
+  export_keys() -> (Vec<u8>, Vec<u8>)
+      (dk_seed_64, ek). The level is recoverable from the ek
+      length (1184 or 1568 bytes).
 
-The final chunk is always present. If the plaintext length is an
-exact multiple of chunk_size, the final chunk has zero-length
-plaintext and consists only of the AEAD tag (16 bytes).
+  import_keys(dk_seed: &[u8], ek: &[u8])
+      Result<Self, CipherboxError>
+      The ek must match the seed, and is checked against the
+      level's key-validation routine.
 
-The AEAD key is derived as:
+  level() -> KemLevel
+  encapsulation_key() -> &[u8]
+  decapsulation_key() -> &[u8]
 
-  aead_key = SHA3-256("cipherbox-file-v1" || header || shared_secret)
+Free KEM functions
+------------------
+  validate_encapsulation_key(ek: &[u8]) -> Result<KemLevel, _>
+  encapsulate_to(ek: &[u8]) -> Result<(Vec<u8>, Vec<u8>), _>
+  encapsulate_any(ek: &[u8]) -> Result<(Suite, Vec<u8>, [u8; 32]), _>
 
+HybridKeyPair
+-------------
+  new(level: KemLevel) -> Result<Self, _>
+  from_seed(seed: &[u8], level) -> Result<Self, _>
+  from_secret(secret: &[u8]) -> Result<Self, _>
+      From the 34-byte self-describing secret
+      (version, level id, seed32).
+  export_secret() -> Vec<u8>
+  public_key() -> &[u8]
+      ML-KEM ek || X25519 pk. 1216 or 1600 bytes.
+  decapsulate(ct) -> Result<Vec<u8>, _>
+
+Free hybrid functions
+---------------------
+  encapsulate_hybrid_to(ek: &[u8]) -> Result<(Vec<u8>, Vec<u8>), _>
+  hybrid::encaps_deterministic(ek, m, eph_sk)
+      -> Result<(Vec<u8>, [u8; 32]), _>
+  hybrid::validate_hybrid_public_key(ek) -> Result<KemLevel, _>
+  validate_public_key(ek) -> Result<Suite, _>
+
+Decapsulator trait
+------------------
+  suite() -> Suite
+  public_key_bytes() -> &[u8]
+  decapsulate_raw(ct) -> Result<[u8; 32], _>
+  Implemented by MlKemKeyPair and HybridKeyPair. Used by the
+  wrap/unwrap functions and by the file decryptor's hybrid path.
+
+MlDsaKeyPair / MlDsa87KeyPair
+-----------------------------
+  new()
+  sign(msg)
+  verify(msg, sig)
+  export_keys()
+  import_keys(seed, vk)
+  ML-DSA-65 and ML-DSA-87, via ml-dsa. See section 9 for sizes.
+
+Free ML-DSA verification
+------------------------
+  ml_dsa_verify(vk_bytes, message, signature) -> bool
+  Level inferred from key length (1952 = 65, 2592 = 87).
+  Returns false for anything malformed. No panic.
+
+Passphrase encryption
+---------------------
+  encrypt_private_key(plaintext, passphrase)
+  encrypt_private_key_with_params(plaintext, passphrase, m, t, p)
+  decrypt_private_key(blob, passphrase)
+  Blob format v2:
+      "CBPK" | 0x02 | m u32 LE | t u32 LE | p u32 LE
+      | salt 16 | nonce 12 | AEAD ciphertext
+  The 17-byte header is authenticated as AAD. Legacy v1 blobs
+  (salt | nonce | ct, default Argon2id parameters) are still
+  accepted on decrypt.
+
+Key wrapping
+------------
+  wrap_key(ek, plaintext) -> Result<Vec<u8>, _>
+  unwrap_key<K: Decapsulator>(kp, blob) -> Result<Vec<u8>, _>
+  wrap_room_key_for_user(pk_b64, room_key) -> Result<String, _>
+  unwrap_room_key<K: Decapsulator>(kp, version, ct_b64, iv_b64,
+                                   enc_b64) -> Result<String, _>
+  Binary blob:
+      "CBWK" | 0x01 | kem_ct | nonce 12 | aead_ct
+  JSON blob (v2):
+      {"v":2,"ct":"...","iv":"...","enc_aes":"..."}
+  Legacy JSON (v1) still decryptable by passing version = 1.
+
+Rooms
+-----
+  RoomSecret::derive(context, sources, params)
+      Argon2id over each source, sorted, then hashed with a
+      length-prefixed, domain-separated construction.
+  Room::join(secret)
+  Room::join_with_sender_id(secret, id)
+  Room::from_keys(room_id, epoch, epoch_key, sender_id)
+  Room::seal(plaintext)
+  Room::seal_signed(plaintext, signer)
+  Room::open(envelope, verify)
+  Room::rekey(member_public_keys, signer) -> RekeyBundle
+  Room::apply_rekey(bundle, my_key, verify)
+  Room::forget_epochs_before(epoch)
+  Room::export_state()
+  Room::import_state(bytes)
+  auth_verifier(auth_token)
+  public_key_fingerprint(pk)
+  next_epoch_key(old, seed, new_epoch)
+  See section 7.
+
+Files
+-----
+  encrypt_file(plaintext, recipient_ek, chunk_size)
+  decrypt_file(ciphertext, recipient_dk)
+  decrypt_file_with_seed(ciphertext, seed)
+  decrypt_file_with_hybrid_secret(ciphertext, secret)
+  FileEncryptor::new(ek, chunk_size), .update(pt, out), .finish(out)
+  FileDecryptor::new(dk), .from_seed(seed),
+                 .from_hybrid_secret(secret),
+                 .update(ct, out), .finish(out)
+  See section 8.
+
+Constants
+---------
+  kem::EK_BYTES             1184
+  kem::DK_BYTES             2400
+  kem::CT_BYTES             1088
+  kem::EK_BYTES_1024        1568
+  kem::DK_BYTES_1024        3168
+  kem::CT_BYTES_1024        1568
+  file::CHUNK_SIZE_DEFAULT  65536
+  file::CHUNK_SIZE_MIN      64
+  file::CHUNK_SIZE_MAX      1048576
+  room::MAX_MESSAGE_BYTES   1048576
+  room::PAD_BLOCK           256
+  room::MAX_SKIP            1000
+
+
+================================================================================
+  6.  HYBRID KEM CONSTRUCTION
+================================================================================
+
+The hybrid KEM combines X25519 and ML-KEM so that the shared secret
+is secure if either holds.
+
+Seed expansion (one 32-byte seed -> both halves):
+
+  (d || z || x25519_sk) = SHAKE-256(
+      "cipherbox-hybrid-v1" || level_id || seed32, 96)
+
+Public key:
+
+  ek_mlkem || x25519_pk
+      1216 bytes for ML-KEM-768 hybrid
+      1600 bytes for ML-KEM-1024 hybrid
+
+Ciphertext:
+
+  ct_mlkem || x25519_ephemeral_pk
+      1120 bytes for ML-KEM-768 hybrid
+      1600 bytes for ML-KEM-1024 hybrid
+
+Shared secret:
+
+  ss = SHA3-256(
+      "cipherbox-hybrid-v1" || level_id
+      || ss_mlkem || ss_x25519
+      || ct_mlkem || ct_x25519
+      || ek_mlkem || x25519_pk)
+
+The combiner hashes the whole transcript - both shared secrets,
+both ciphertexts, and the entire public key - so the result is
+bound to this exact key and this exact exchange. The seed
+expansion is domain-separated by level, so the same seed
+produces unrelated keys at the two levels.
+
+Sender-side: an X25519 public key that produces an all-zero
+shared secret (a low-order point) is rejected.
+
+Receiver-side: the X25519 result is included in the hash
+unconditionally, so a malformed ciphertext simply produces an
+unrelated secret rather than an error.
+
+This is the X-Wing construction style. It is NOT byte-compatible
+with X-Wing - the domain strings and the seed expansion differ.
+Do not mix this crate's hybrid public keys with X-Wing
+implementations.
+
+
+================================================================================
+  7.  ROOM PROTOCOL
+================================================================================
+
+A room is identified and keyed by a secret that members obtain out
+of band (a passphrase, the hash of a photo, a QR code, or several
+of these combined). No server-side member list, invitation, or
+key distribution is required.
+
+Derivation:
+
+  k_i     = Argon2id(source_i, salt = H(context, params))
+            per source
+  root    = H("root", context, params, n, sort(k_1 .. k_n))
+  room_id = H("room-id", root)
+  auth    = H("auth", root)
+  epoch_0 = H("epoch0", root)
+
+The order of sources does not matter. context (a server name, a
+room label) separates unrelated rooms that share sources. auth is
+a bearer token; the server should store only auth_verifier(auth),
+not auth itself.
+
+Messages:
+
+  Every sender has a 16-byte id and a per-epoch hash chain.
+
+  chain_0    = H("chain0", epoch_key, sender_id, epoch)
+  msg_key_n  = H("msg-key", chain_n)
+  nonce_n    = H("msg-nonce", chain_n)[..12]
+  chain_n+1  = H("chain-next", chain_n)
+
+Each message key is used once and the chain key is overwritten
+after use. A device compromised later cannot decrypt messages it
+already processed, provided the root secret itself was not
+retained or leaked.
+
+Ratchet state advances only after a message authenticates, so
+garbage cannot be used to burn message keys. Skipped messages are
+tracked in a bounded window (MAX_SKIP); messages beyond the window
+are refused rather than buffered.
+
+Forward secrecy properties:
+
+  Against state compromise: yes.
+
+  Against leak of the root secret (a stolen passphrase): no. That
+  is inherent to secret-derived rooms. Use Room::rekey to inject
+  fresh randomness wrapped to members' KEM public keys; later
+  epochs then stay secret even if the root leaks. This is
+  post-compromise security and is the reason the rekey function
+  exists.
+
+Sender authenticity:
+
+  Optional. seal_signed attaches an ML-DSA signature to the
+  envelope. open with a verifier rejects unsigned messages and
+  messages whose signature does not verify, before any ratchet
+  state is touched. Without signatures, any holder of the root
+  can impersonate any sender id.
+
+Envelope format (version 1):
+
+  "CBRM" | 0x01 | flags u8 | room_id 32 | epoch u32 LE
+  | sender_id 16 | index u32 LE
+  | ct_len u32 LE | ChaCha20-Poly1305 ciphertext
+  | [flags & 1: sig_len u16 LE | signature]
+
+The signature, when present, covers:
+
+  "cipherbox-room-v1/msg-sig" || header || ct_len || ct
+
+Rekey bundle format (version 1):
+
+  "CBRK" | 0x01 | room_id 32 | epoch u32 LE | n u32 LE
+  | (recipient_fingerprint 32 | len u32 LE | wrapped seed)*
+  | sig_len u16 LE | signature
+
+The signature covers:
+
+  "cipherbox-room-v1/rekey-sig" || room_id || epoch || n || entries
+
+rekey requires a signer, and apply_rekey requires a verifier. A
+bundle that is not signed by a key the caller trusts is rejected.
+This is what stops someone who merely knows the room secret from
+hijacking the room.
+
+State export is a self-describing binary blob:
+
+  "CBRS" | 0x01 | ...
+
+Encrypt it before storing - it contains the ratchet state, which
+is secret.
+
+
+================================================================================
+  8.  FILE FORMAT
+================================================================================
+
+Chunked encryption of arbitrarily large files using the STREAM
+construction.
+
+Header, version 1 (ML-KEM-768 only):
+
+  "CBOX" | 0x01 | chunk_size u32 LE | kem_ct (1088)
+
+Header, version 2 (any suite):
+
+  "CBOX" | 0x02 | suite_id u8 | chunk_size u32 LE | kem_ct
+
+Suite ids:
+
+  3     ML-KEM-768
+  5     ML-KEM-1024
+  0x13  X25519 + ML-KEM-768
+  0x15  X25519 + ML-KEM-1024
+
+For hybrid suites, kem_ct is ct_mlkem || ct_x25519.
+
+Key derivation:
+
+  aead_key = SHA3-256(domain || header || shared_secret)
+
+  domain        = "cipherbox-file-v1" for v1
+                  "cipherbox-file-v2" for v2
   header        = every byte from magic through the end of kem_ct
-  shared_secret = ML-KEM shared secret from decapsulating kem_ct
+  shared_secret = 32 bytes from the KEM
 
-This binding is important. It means that the AEAD key depends on the
-header bytes. If an attacker flips any bit in the header — the
-magic, the version, the chunk_size, or the KEM ciphertext — the
-derived key will be different, and every chunk will fail
-authentication. There is no way to modify the header without
-invalidating the whole file.
+Because the header is part of the KDF input, modifying any header
+byte makes every chunk fail authentication.
 
-Truncation detection:
+Chunk framing:
 
-  A ciphertext that has had its last chunk stripped produces a
-  stream whose remaining chunks decrypt correctly but whose final
-  chunk has last_flag = 0. The decryptor's finish() method always
-  uses last_flag = 1 for the last chunk; the AEAD tag computed by
-  the sender under last_flag = 0 will not verify. The decryptor
-  returns an error. No partial plaintext is accepted.
+  ChaCha20-Poly1305 with nonce
 
-  Similarly, a ciphertext that has had middle chunks stripped
-  produces a stream where the chunk counter does not match the
-  expected chunk index. The decryptor's update() checks this
-  implicitly: the chunk at index N is decrypted with nonce derived
-  from counter N, so removing a chunk shifts all subsequent counters
-  and every chunk after the removal fails authentication.
+  counter (u64 LE) || 00 00 00 || last_flag
 
-Reorder detection:
+  last_flag = 0x01 for the final chunk, 0x00 otherwise
+  AAD = "CBOX-v1-chunk"
 
-  Swapping two chunks changes their counters. The AEAD tag for chunk
-  N is computed under counter N; decrypting it as chunk M produces
-  a tag mismatch. Reordering fails.
+The last chunk is always present and may be empty. Stripping
+trailing chunks leaves a final chunk authenticated with
+last_flag = 0, which fails when decrypted as the last chunk.
 
-The format has no external length field. The decryptor learns the
-plaintext length only by processing all chunks and reaching the final
-one. This is standard for STREAM constructions and is what makes the
-format work for streaming input of unknown length.
+Streaming:
 
-Limitations:
+  Both FileEncryptor and FileDecryptor accept arbitrary-sized
+  slices. Every possible split point of the plaintext or
+  ciphertext across update calls produces the same output. This
+  is tested exhaustively.
 
-  The format does not compress. It does not hide the plaintext
-  length (the ciphertext length is header + chunks + tags, which is
-  a deterministic function of the plaintext length rounded up to
-  chunk_size). It does not provide forward secrecy — the KEM
-  ciphertext in the header is the only key material, and whoever
-  holds the decapsulation key can decrypt the file at any time.
+Truncation, reordering, tampering:
 
-  If you need forward secrecy, you need a different construction
-  where the KEM key is ephemeral and the decryption key is
-  destroyed after use. That is a protocol-level decision, not a
-  format-level one.
+  Truncation   Detected at finish by the last_flag mismatch.
+  Reordering   Detected because the nonce contains the chunk
+               counter, so a chunk decrypted with the wrong
+               counter fails its AEAD tag.
+  Header tampering
+               Detected because the header is bound into the
+               AEAD key derivation.
+  Body tampering
+               Detected per chunk by the AEAD tag.
+
+Partial plaintext is never written to the output on failure.
 
 
 ================================================================================
-  7.  CLI TOOLS
+  9.  TESTING AND VALIDATION
 ================================================================================
 
-Five binaries are provided. All use only the core crate, base64, and
-the Rust standard library.
+Test files:
 
-cipherbox-pqc-keygen
-----------------------
+  tests/keccak_kat.rs    3 tests
+      SHA3-256/512, SHAKE-128/256. NIST-published vectors and
+      hashlib-generated vectors for multi-block inputs.
 
-  Generate a fresh ML-KEM-768 keypair.
+  tests/kat.rs           3 tests
+      ML-KEM-768 and ML-KEM-1024 KATs from OpenSSL.
+      File-format KATs from an independent Python model.
 
-  Usage:
-      cipherbox-pqc-keygen                    # print to stdout
-      cipherbox-pqc-keygen --out <dir>        # write ek.b64 and dk_seed.b64
+  tests/hybrid.rs        17 tests
+      Hybrid KATs, keygen/encaps/decaps, low-order rejection,
+      file encryption to hybrid keys.
 
-  Output format:
-      EK=<base64 1184-byte encapsulation key>
-      DK_SEED=<base64 64-byte seed (d || z)>
+  tests/room.rs          19 tests
+      Room derivation, ratchet, signatures, rekey, state
+      persistence. KAT from an independent Python model.
 
-  The seed is sufficient to reconstruct both halves of the keypair.
-  Store it encrypted; anyone with the seed can decapsulate.
+  tests/integration.rs   23 tests
+      End-to-end across KEM, file, wrap, passphrase, and ML-DSA
+      at both levels.
 
-cipherbox-pqc-file-encrypt
-----------------------------
+  Inline unit tests      15 tests
+      Field arithmetic, NTT, poly encoding, compress/decompress.
 
-  Encrypt a file using chunked streaming.
+Total: 80 tests, all passing.
 
-  Usage:
-      cipherbox-pqc-file-encrypt <recipient_pk_b64> <input> <output> [chunk_size]
+Independent models:
 
-  chunk_size defaults to 65536 bytes. Range: [64, 1048576].
+  Keccak vectors from NIST and Python hashlib.
+  ML-KEM vectors from OpenSSL (via python-cryptography).
+  Hybrid and file vectors from an independent Python model that
+  uses OpenSSL-validated ML-KEM and RFC 7748 X25519.
+  Room vectors from an independent Python model that uses hashlib
+  SHA3, python-cryptography Argon2id (checked against RFC 9106),
+  and python-cryptography ChaCha20-Poly1305.
 
-  The recipient's public key is 1184 bytes encoded as base64.
+What is not covered:
 
-cipherbox-pqc-file-decrypt
-----------------------------
+  NIST ACVP vectors for ML-KEM. Not currently in tests/vectors/.
 
-  Decrypt a file produced by cipherbox-pqc-file-encrypt.
+Reproducing:
 
-  Usage:
-      cipherbox-pqc-file-decrypt <dk_seed_b64> <input> <output>
-
-  Any tampering, truncation, or reordering of the ciphertext causes
-  the command to exit non-zero with an error message. Partial
-  plaintext is never written to the output.
-
-cipherbox-pqc-verify
-----------------------
-
-  Verify an ML-DSA-65 signature (unchanged from previous versions).
-
-  Usage:
-      cipherbox-pqc-verify <public_key_b64> <message_b64> <signature_b64>
-
-  Prints "true" and exits 0 on success; "false" and exits 1 on
-  failure.
-
-cipherbox-pqc-wrap
---------------------
-
-  Wrap a plaintext room key to a user's ML-KEM public key, producing
-  JSON suitable for transmitting a symmetric key to the recipient.
-  (Unchanged from previous versions.)
-
-  Usage:
-      cipherbox-pqc-wrap <user_kyber_pk_b64> <plaintext_room_key>
-
-
-================================================================================
-  8.  LIBRARY USAGE
-================================================================================
-
-Basic key encapsulation:
-
-  use cipherbox_pqc_core::MlKemKeyPair;
-
-  let kp = MlKemKeyPair::new()?;
-  let (ct, shared_secret_sender) = kp.encapsulate()?;
-  let shared_secret_recipient = kp.decapsulate(&ct)?;
-  assert_eq!(shared_secret_sender, shared_secret_recipient);
-
-Reconstructing from the seed:
-
-  let kp = MlKemKeyPair::new()?;
-  let (seed, _ek) = kp.export_keys();
-  let kp2 = MlKemKeyPair::from_seed(&seed)?;
-
-Chunked file encryption:
-
-  use cipherbox_pqc_core::file::{encrypt_file, decrypt_file};
-  use cipherbox_pqc_core::MlKemKeyPair;
-
-  let recipient = MlKemKeyPair::new()?;
-  let ek = recipient.encapsulation_key();
-  let dk = recipient.decapsulation_key();
-
-  let plaintext = b"large file contents here";
-  let ct = encrypt_file(plaintext, ek, 65536)?;
-  let pt = decrypt_file(&ct, dk)?;
-  assert_eq!(pt, plaintext);
-
-Streaming encryption for files larger than memory:
-
-  use cipherbox_pqc_core::file::{FileEncryptor, FileDecryptor};
-
-  let mut enc = FileEncryptor::new(ek, 65536)?;
-  let mut ct = Vec::new();
-  for chunk in source_chunks {
-      enc.update(chunk, &mut ct)?;
-  }
-  enc.finish(&mut ct)?;
-
-  let mut dec = FileDecryptor::new(dk);
-  let mut pt = Vec::new();
-  for chunk in ciphertext_chunks {
-      dec.update(chunk, &mut pt)?;
-  }
-  dec.finish(&mut pt)?;
-
-Passphrase encryption (unchanged, uses Argon2 + ChaCha20-Poly1305):
-
-  use cipherbox_pqc_core::{encrypt_private_key, decrypt_private_key};
-
-  let encrypted = encrypt_private_key(seed_bytes, "passphrase")?;
-  let recovered = decrypt_private_key(&encrypted, "passphrase")?;
-
-ML-DSA signatures (via the ml-dsa crate, not from scratch):
-
-  use cipherbox_pqc_core::MlDsaKeyPair;
-
-  let kp = MlDsaKeyPair::new();
-  let msg = b"hello, post-quantum world";
-  let sig = kp.sign(msg);
-  assert!(kp.verify(msg, &sig));
-
-
-================================================================================
-  9.  TESTING AND FUZZING
-================================================================================
-
-Test suite (all green, `cargo test --all-targets`):
-
-  keccak_kat.rs    9   SHA3-256, SHA3-512, SHAKE-128, SHAKE-256 KATs
-  field_kat.rs     12  Field arithmetic exhaustive property tests
-  ntt_kat.rs       7   NTT / InvNTT / basemul / poly_mul correctness
-  poly_kat.rs      16  CBD, compress/decompress, byte encoding
-  pke_kat.rs       6   IND-CPA PKE roundtrip and determinism
-  kem_kat.rs       7   IND-CCA KEM roundtrip and implicit rejection
-  file_kat.rs      16  Chunked file format, truncation, reordering
-  acvp_kat.rs      2   NIST ACVP keyGen and encapDecap vectors
-  (native)
-  native_crypto.rs 6   Existing verify, wrap, ML-KEM roundtrip tests
-  file_decrypt.rs  8   CLI end-to-end for keygen, encrypt, decrypt
-
-Total: 89 tests.
-
-Fuzzing (libFuzzer, nightly):
-
-  decrypt_file: 12,378,253 executions in 121 seconds.
-                Reached 708 edges of the file decrypt path.
-                Zero crashes. Corpus grew to 22 inputs.
-                Dictionary hits included the magic "CBOX",
-                the version byte, and the chunk_size field.
-
-  kem_decaps:     87,847 executions in 121 seconds.
-                Reached 214 edges of the KEM decapsulation path.
-                Zero crashes. Slow per-execution (~1.4 ms) because
-                each call does pke_decrypt + pke_encrypt + four
-                SHA3-512 + one SHAKE-256.
-
-The fuzzing was a bounded campaign, not an exhaustive one. The
-numbers above are what actually ran. Do not read them as "no bugs
-exist"; read them as "no crashes were found in these specific runs."
-A production deployment would run these fuzzers for hours,
-preferably overnight, with a seeded corpus. That is a maintenance
-activity, not a one-time claim.
-
-CI target:
-
-  make ci
-      cargo fmt --all -- --check
-      cargo clippy --all-targets -- -D warnings
-      cargo test --all-targets
+  cargo test --all-targets
+  cargo clippy --all-targets -- -D warnings
 
 
 ================================================================================
  10.  SECURITY MODEL AND HONEST LIMITATIONS
 ================================================================================
 
-What is verified:
+WHAT IS VERIFIED
 
-  - ML-KEM-768 conformance to NIST ACVP vectors (60 cases).
-  - Round-trip correctness of every cryptographic primitive in the
-    algorithm (PKE, KEM, file format).
-  - Constant-time behavior of field arithmetic with respect to
-    input values (no data-dependent branches, no division, no table
-    lookups).
-  - Implicit rejection in the FO transform (invalid ciphertext
-    produces a deterministic pseudorandom value, not an error).
-  - Chunked file format detects truncation, reordering, and any
-    header tampering.
-  - No panics on adversarial input in the fuzzed paths.
+  - Round-trip correctness of every cryptographic primitive in
+    every suite.
 
-What is NOT verified:
+  - Constant-time behaviour of field arithmetic with respect to
+    input values (no data-dependent branches, no division, no
+    table lookups) in the source code. Not verified on the
+    compiled binary.
+
+  - Implicit rejection in the Fujisaki-Okamoto transform -
+    invalid ciphertext produces a deterministic pseudorandom
+    value, not an error.
+
+  - Key validation per FIPS 203 section 7.2 and 7.3 before any
+    encapsulate or decapsulate call touches an untrusted key.
+
+  - Chunked file format detects truncation, reordering, header
+    tampering, and body tampering.
+
+  - Room ratchet cannot be advanced by forged envelopes;
+    signatures are checked before any state change.
+
+  - Zeroization of all key material types on drop, and of
+    intermediates after use.
+
+WHAT IS NOT VERIFIED
 
   - Independent third-party audit. There has been none.
+
   - Formal verification. No mechanized proof of correctness.
-  - Side-channel resistance beyond what the code actually does.
-    The field arithmetic is constant-time with respect to input
-    values. But the compiler can optimize across function
-    boundaries in ways that introduce data-dependent timing, and
-    we have not analyzed the compiled output. WebAssembly and JIT
-    environments are worse: their timing characteristics are not
-    under our control.
-  - Memory wiping. Keys are held in fixed-size arrays and are not
-    explicitly zeroized after use. If you hold a MlKemKeyPair in
-    memory, an attacker with process memory access can observe it
-    while it is alive. This is a known limitation. Adding zeroize
-    to all key types is a straightforward future improvement.
-  - Performance. The implementation is not optimized. It is
-    correct. If you need fast ML-KEM, use RustCrypto.
 
-When to use this library:
+  - Side-channel resistance beyond what the source code does.
+    No timing measurements on the compiled binary. No masking,
+    shuffling, or blinding.
 
-  - You want to understand ML-KEM by reading its implementation.
-  - You want a transparent, ACVP-validated building block that you
+  - WebAssembly and JIT environments. Not analysed at all.
+
+WHEN TO USE THIS CRATE
+
+  - You want to understand ML-KEM, the hybrid construction, or a
+    symmetric ratchet by reading a small, self-contained
+    implementation.
+
+  - You want a transparent, KAT-validated building block that you
     can audit or fork.
+
   - You want a fully specified chunked file format that you can
     implement in another language if you need to.
+
   - You are learning or teaching.
 
-When NOT to use this library:
+WHEN NOT TO USE THIS CRATE
 
   - You need a certified, audited, production-grade KEM. Use a
     library that has been certified or audited.
-  - You need maximum performance. Use an optimized implementation.
-  - You need features this library does not provide (ML-KEM-1024,
-    hybrid KEX, protocol negotiation, certificate handling, etc.).
+
+  - You need ACVP conformance today. This crate does not
+    currently claim it.
+
+  - You need features this crate does not provide (ML-DSA from
+    scratch, network protocol, certificate handling, etc.).
 
 
 ================================================================================
- 11.  RELATIONSHIP TO OTHER PQC PROJECTS
+ 11.  COMPARISON TO RUSTCRYPTO AND OTHER PROJECTS
 ================================================================================
 
 RustCrypto ml-kem
 -----------------
 
-  This project's ML-KEM is not a wrapper around the ml-kem crate.
-  The RustCrypto crate is what most Rust applications should use;
-  it is security-assessed, maintained, and used in production. This
-  project exists for a different purpose: transparency at the
-  algorithm level. If you are building a product, use ml-kem. If
-  you are building a reference implementation or an auditable
-  system, use this.
+  The RustCrypto ml-kem crate is what most Rust applications
+  should use for ML-KEM. It is security-assessed, maintained,
+  and used in production. This crate exists for a different
+  purpose: transparency at the algorithm level, and a fully
+  specified file and room layer on top of it. If you are
+  building a product, use ml-kem. If you are building a
+  reference implementation or an auditable system, use this.
 
-Polynom (closed-source collaboration product)
----------------------------------------------
+Polynom
+-------
 
-  Polynom is a collaboration platform that uses Kyber-1024 for key
-  exchange and Dilithium5 for signatures, plus a proprietary
-  "Social Encryption" layer that derives keys from shared entropy.
-  It is a complete product (chat, rooms, file sharing, mobile
-  apps). This project is a toolkit: a KEM, a file format, and CLI
-  tools. Different users, different trust model. Neither is a
-  substitute for the other.
+  Polynom is a closed-source collaboration platform that uses
+  Kyber-1024 and Dilithium5, plus a proprietary entropy-based
+  key exchange layer. It is a complete product (chat, rooms,
+  file sharing, mobile apps). This crate is a toolkit: a KEM,
+  a hybrid, a file format, and a room protocol. Different users,
+  different trust model.
 
-  Where this project differs from Polynom:
-
-    - Uses ML-KEM-768 (Level III) instead of Kyber-1024 (Level V).
-      Both are FIPS 203 conformant. Level III is smaller and faster;
-      Level V is more conservative.
+  Where this crate differs from Polynom:
+    - Uses ML-KEM-768 (Level III) as the default, with
+      ML-KEM-1024 available.
     - Uses ChaCha20-Poly1305 instead of AES-256-GCM.
-    - Publishes ACVP validation results. Polynom's whitepaper says
-      it uses Kyber-1024 and Dilithium5; it does not publish test
-      vectors.
-    - Publishes the file encryption format. Polynom does not.
-    - Is not a product. It is a building block.
+    - Publishes KAT vectors generated from independent
+      implementations.
+    - Publishes the file and room formats.
 
-  Where Polynom differs from this project:
-
-    - Is a complete product with a UI, network protocols, mobile
-      apps, and a user-facing feature set.
-    - Uses a proprietary entropy-based key exchange layer that is
-      not a NIST standard and is not independently auditable.
-    - Uses Dilithium5 instead of ML-DSA-65 for signatures.
-
-  These are different projects solving different problems. Do not
-  compare them on features; compare them on whether the transparency
-  of the cryptographic core matters to you.
+  Where Polynom differs from this crate:
+    - Is a complete product with a UI and network protocols.
+    - Uses a proprietary entropy layer that is not a NIST
+      standard.
 
 liboqs
 ------
 
-  liboqs is the reference C library for post-quantum cryptography.
-  It implements many more algorithms than this project (ML-KEM,
-  ML-DSA, FrodoKEM, BIKE, HQC, etc.) and is the library used by
-  OpenSSL's PQC support. If you need breadth, use liboqs. This
-  project is narrower: one KEM, from scratch, with ACVP
-  validation and a file format.
+  liboqs is the reference C library for post-quantum
+  cryptography. It implements many more algorithms than this
+  crate, and is the library used by OpenSSL's PQC support. If
+  you need breadth, use liboqs. This crate is narrower:
+  from-scratch ML-KEM with a fully specified hybrid, file
+  format, and room protocol on top.
 
 
 ================================================================================
@@ -657,41 +818,63 @@ liboqs
 Requirements:
 
   Rust 1.85 or later (edition 2024).
-  For fuzzing: rustup with nightly toolchain.
+  No C compiler, no system libraries.
 
-Build the whole workspace:
+Build:
 
   cargo build --release
-
-Build only the native crate:
-
-  cd cipherbox-pqc-native
-  cargo build --release
-  # Binaries in target/release/
 
 Run tests:
 
   cargo test --all-targets
 
-Run ACVP vectors with visible output:
+Run clippy:
 
-  cd cipherbox-pqc-core
-  cargo test acvp -- --nocapture
+  cargo clippy --all-targets -- -D warnings
 
-Fuzz (requires nightly):
+Full CI:
 
-  cd cipherbox-pqc-core/fuzz
-  cargo +nightly fuzz run decrypt_file -- -max_total_time=120
-  cargo +nightly fuzz run kem_decaps   -- -max_total_time=120
+  cargo fmt --all -- --check
+  cargo clippy --all-targets -- -D warnings
+  cargo test --all-targets
 
 
 ================================================================================
- 13.  LICENSE
+ 13.  DEPENDENCIES
+================================================================================
+
+  getrandom 0.2
+      OS entropy.
+
+  ml-dsa =0.1.2
+      ML-DSA-65 and ML-DSA-87 signatures. Pinned for
+      reproducibility; contains the fix for CVE-2026-24850.
+
+  chacha20poly1305 0.10
+      AEAD for file chunks, room messages, key wrapping, and
+      passphrase blobs.
+
+  argon2 0.5
+      Argon2id for passphrase and room source stretching.
+
+  base64 0.22
+      Encoding for CLI and JSON formats.
+
+  zeroize 1
+      Zeroization on drop.
+
+  x25519-dalek 2
+      X25519 for the hybrid KEM.
+
+None of these is a KEM. The ML-KEM implementation and the hybrid
+combiner are entirely in this crate.
+
+
+================================================================================
+ 14.  LICENSE
 ================================================================================
 
 MIT. See LICENSE file for the full text.
 
-Repository: https://github.com/thomas666-beast/cipherbox-pqc-native
+Repository: https://github.com/thomas666-beast/cipherbox-pqc-core
 Author:     Thomas <selfworker112@mailfence.com>
-
-================================================================================

@@ -91,7 +91,7 @@ pub fn keccak_f1600(state: &mut State) {
 }
 
 fn absorb(state: &mut State, input: &[u8], rate: usize, domain: u8) {
-    debug_assert!(rate.is_multiple_of(8));
+    debug_assert!(rate % 8 == 0);
     debug_assert!(rate < 200);
 
     let mut block = [0u8; 200];
@@ -114,7 +114,7 @@ fn absorb(state: &mut State, input: &[u8], rate: usize, domain: u8) {
 
 fn xor_block_into_state(state: &mut State, block: &[u8], rate: usize) {
     debug_assert_eq!(block.len(), rate);
-    debug_assert!(rate.is_multiple_of(8));
+    debug_assert!(rate % 8 == 0);
     for i in 0..(rate / 8) {
         let lane = u64::from_le_bytes(block[i * 8..i * 8 + 8].try_into().unwrap());
         state[i] ^= lane;
@@ -122,7 +122,7 @@ fn xor_block_into_state(state: &mut State, block: &[u8], rate: usize) {
 }
 
 fn squeeze(state: &mut State, output: &mut [u8], rate: usize) {
-    debug_assert!(rate.is_multiple_of(8));
+    debug_assert!(rate % 8 == 0);
 
     let mut offset = 0;
     loop {

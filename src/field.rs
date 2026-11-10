@@ -49,13 +49,13 @@ impl FieldElement {
         FieldElement { mont }
     }
 
+    /// Branchless negation. `Q - mont` lies in `1..=Q`; the value `Q`
+    /// (only produced when `mont == 0`) is mapped back to 0 with a mask.
     pub fn neg_mod(self) -> Self {
-        if self.mont == 0 {
-            self
-        } else {
-            FieldElement {
-                mont: Q - self.mont,
-            }
+        let v = (Q - self.mont) as u32;
+        let lt_q = (v.wrapping_sub(Q as u32) >> 31) as u16; // 1 if v < Q
+        FieldElement {
+            mont: (v as u16) & lt_q.wrapping_neg(),
         }
     }
 
@@ -163,6 +163,15 @@ pub fn montgomery_reduce(a: u32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn neg_is_additive_inverse() {
+        for x in 0u16..Q {
+            let fe = FieldElement::from_u16(x);
+            assert_eq!((fe + (-fe)).to_u16(), 0, "x = {x}");
+        }
+        assert_eq!((-FieldElement::ZERO).to_u16(), 0);
+    }
 
     #[test]
     fn inverse_of_qinv() {
