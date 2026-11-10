@@ -225,39 +225,122 @@ PROVIDED BY DEPENDENCIES, NOT REWRITTEN
   4.  WHAT IS NOT IN THIS CRATE
 ================================================================================
 
-  - Not audited. There has been no independent third-party
-    security audit of this crate. Do not treat it as production-
-    ready cryptography without one.
+Read this before section 5. It is ordered by how much each item
+should affect your decision to use the crate.
 
-  - Not ACVP-validated for ML-KEM. The KEM is validated against an
-    independent OpenSSL-derived KAT and against OpenSSL-generated
-    vectors that cover the same algorithm, but the NIST ACVP test
-    vectors are not currently in tests/vectors/. Until they are
-    restored and passing, this crate does not claim ACVP
-    conformance.
+TRUST BARRIERS - these should stop you from using the crate in
+production today
 
-  - No network protocol. This crate provides primitives and file
-    formats. It does not implement transport, framing,
-    authentication of peers, or discovery. Those belong in the
-    application that uses this crate.
+  Not audited.
+      There has been no independent third-party security audit.
+      No external review of the code, the constructions, or the
+      file formats. Do not deploy this crate to protect anything
+      that matters until an audit has been performed. If you
+      need an audited ML-KEM today, use the RustCrypto ml-kem
+      crate, which has been security-assessed.
 
-  - No ML-DSA implementation. Signatures use the RustCrypto
-    ml-dsa crate. If your threat model requires those to be
-    from-scratch as well, this crate does not meet it.
+  Not ACVP-validated for ML-KEM.
+      The KEM is validated against an OpenSSL-derived KAT and
+      against OpenSSL-generated vectors that cover the same
+      algorithm. The NIST ACVP test vectors are not currently in
+      tests/vectors/, so this crate does not claim FIPS 203
+      conformance. If you need to make an ACVP conformance
+      claim today, use a library that passes the ACVP suite.
 
-  - No X25519 implementation. The hybrid uses x25519-dalek.
+      This is the single largest gap relative to the earlier
+      versions of this crate, and it is a gap this project can
+      close: restoring tests/vectors/ and tests/acvp.rs brings
+      the crate back to ACVP-validated status. Until then, treat
+      the claim as "independently validated, not ACVP-certified."
 
-  - No constant-time analysis. The field arithmetic is written to
-    be constant-time with respect to input values, and the
-    KyberSlash division has been removed, but no formal
-    verification has been performed and no timing measurement has
-    been done on the compiled binary. WebAssembly and JIT
-    environments are not analysed at all.
+THREAT MODEL BOUNDARIES - these describe what the crate does not
+protect against
 
-  - No side-channel hardening beyond the above. No masking, no
-    shuffling, no blinding. If an attacker can measure fine-
-    grained timing on the machine running this crate, you are
-    outside the model this crate claims to defend.
+  No constant-time analysis on the compiled binary.
+      The field arithmetic is written to be constant-time with
+      respect to input values, and the KyberSlash division has
+      been removed from the source. But no timing measurement
+      has been performed on the compiled binary, no formal
+      verification has been performed on any function, and no
+      masking, shuffling, or blinding has been applied to any
+      arithmetic. A local attacker who can measure fine-grained
+      timing on the machine running this crate is outside the
+      model this crate claims to defend.
+
+  WebAssembly and JIT are not analysed at all.
+      If you compile this crate to wasm32, or run it under a JIT
+      that can reorder instructions, the timing behaviour is not
+      characterised. Do not use this crate in environments where
+      an attacker can observe timing and you cannot control the
+      compiler.
+
+  No protection against a compromised passphrase.
+      The room protocol and the passphrase encryption both
+      depend on a passphrase or an out-of-band source. If that
+      secret leaks, an attacker who recorded traffic can decrypt
+      epoch 0 of a room and any blob encrypted with that
+      passphrase. Room::rekey upgrades a room to post-compromise
+      security for later epochs, but only if the rekey happens
+      before the attacker uses the leaked secret.
+
+SCOPE - these are absent by design, not by omission
+
+  No network protocol.
+      This crate provides primitives and file formats. It does
+      not implement transport, framing, authentication of peers,
+      discovery, or session establishment. Those belong in the
+      application that uses this crate.
+
+  No ML-DSA implementation.
+      ML-DSA-65 and ML-DSA-87 signatures use the RustCrypto
+      ml-dsa crate. They are not rewritten here. If your threat
+      model requires signatures to be from-scratch as well, this
+      crate does not meet it. The ML-KEM and Keccak are from
+      scratch; the signatures are not.
+
+  No X25519 implementation.
+      The hybrid KEM uses x25519-dalek. If your threat model
+      requires the hybrid to be entirely from scratch, this
+      crate does not meet it. The ML-KEM half is from scratch;
+      the X25519 half is not.
+
+  No certificate handling, no key management, no rotation
+  policy.
+      This crate produces keys and ciphertexts. It does not
+      manage their lifecycle. Storing, rotating, revoking, and
+      distributing keys and passphrases is the application's
+      responsibility.
+
+  No interoperability with X-Wing or HPKE.
+      The hybrid construction is documented and pinned by KAT,
+      but it is not byte-compatible with X-Wing, and there is no
+      HPKE integration. If you need to interoperate with an
+      existing deployment that uses either, this crate is not
+      the right building block.
+
+WHAT THIS CRATE IS DESIGNED FOR, GIVEN THE ABOVE
+
+  The crate is designed for three use cases:
+
+    Reference and teaching.
+        A small, readable ML-KEM with a fully specified file
+        format and room protocol, validated against independent
+        implementations. Useful when the goal is to understand
+        or to audit the construction, not to deploy it.
+
+    A building block you intend to audit or fork.
+        If you are going to read the code, run the KATs, and
+        make a decision about it yourself, this crate gives you
+        something to read.
+
+    A format you want to reimplement elsewhere.
+        The file and room formats are fully specified in
+        sections 7 and 8. If you need the format but not the
+        Rust code, the specification is here.
+
+  If none of those describes your use case, the RustCrypto
+  ml-kem crate is the right choice for ML-KEM, and the ml-dsa
+  crate is the right choice for signatures. See section 11.
 
 
 ================================================================================

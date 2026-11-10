@@ -1,0 +1,744 @@
+================================================================================
+                          CIPHERBOX PQC CORE
+                          USER GUIDE
+================================================================================
+
+  This guide is task-oriented. Each section answers "how do I do X?"
+  For the security model, threat model, and honest limitations, read
+  README.md section 4 before using any of this in production.
+
+  Version 0.7.0
+
+================================================================================
+  TABLE OF CONTENTS
+================================================================================
+
+  1.  Installation
+  2.  Your First Key Pair
+  3.  Encapsulation and Decapsulation
+  4.  Signing and Verifying (ML-DSA)
+  5.  Encrypting a Private Key with a Passphrase
+  6.  Wrapping a Key for a Recipient
+  7.  Encrypting a Large File
+  8.  Streaming a Large File
+  9.  Hybrid Keys
+ 10.  Rooms: Group Messaging from a Shared Secret
+ 11.  Rooms: Adding a Member (Rekey)
+ 12.  Persisting Room State
+ 13.  Common Mistakes
+ 14.  Where to Go Next
+
+
+================================================================================
+  1.  INSTALLATION
+================================================================================
+
+Add the crate to your Cargo.toml:
+
+  [dependencies]
+  cipherbox-pqc-core = "0.7"
+
+Import the parts you need:
+
+  use cipherbox_pqc_core::{
+      MlKemKeyPair, MlDsaKeyPair, MlDsa87KeyPair,
+      encrypt_private_key, decrypt_private_key,
+      wrap_key, unwrap_key,
+      wrap_room_key_for_user, unwrap_room_key,
+      encapsulate_to, validate_encapsulation_key,
+      encapsulate_any, validate_public_key,
+      Decapsulator, HybridKeyPair, KemLevel, Suite,
+      file, room,
+      kem,
+  };
+
+Everything is in the crate root except `file` and `room`, which
+are modules.
+
+Error handling: every fallible function returns
+`Result<T, CipherboxError>`. `CipherboxError` implements
+`std::error::Error`, so `?` works in `fn main() -> Result<(),
+Box<dyn std::error::Error>>` and in any function returning a
+`Result` that can absorb it.
+
+
+================================================================================
+  2.  YOUR FIRST KEY PAIR
+================================================================================
+
+ML-KEM-768 (the default):
+
+  let kp = MlKemKeyPair::new()?;
+
+  println!("level:  {}", kp.level().name());          // ML-KEM-768
+  println!("ek len: {}", kp.encapsulation_key().len()); // 1184
+  println!("dk len: {}", kp.decapsulation_key().len()); // 2400
+
+ML-KEM-1024:
+
+  let kp = MlKemKeyPair::new_with_level(KemLevel::MlKem1024)?;
+
+  println!("ek len: {}", kp.encapsulation_key().len()); // 1568
+  println!("dk len: {}", kp.decapsulation_key().len()); // 3168
+
+Export for storage. The seed is 64 bytes and uniquely determines
+both halves of the key pair:
+
+  let (dk_seed, ek) = kp.export_keys();
+  assert_eq!(dk_seed.len(), 64);
+  assert_eq!(ek.len(), 1184);
+
+Import from a stored seed:
+
+  let kp = MlKemKeyPair::from_seed(&dk_seed)?;
+
+  // Or, if you also have the ek and want to verify it matches:
+  let kp = MlKemKeyPair::import_keys(&dk_seed, &ek)?;
+
+`from_seed` always succeeds if the seed is 64 bytes. `import_keys`
+additionally checks that the `ek` you supplied matches the seed,
+and fails if it does not. Use `import_keys` when the `ek` came
+from an untrusted source.
+
+To choose the level from the `ek` length:
+
+  let level = KemLevel::from_ek_len(ek.len())
+      .ok_or("unrecognised ek length")?;
+  let kp = MlKemKeyPair::from_seed_with_level(&dk_seed, level)?;
+
+
+================================================================================
+  3.  ENCAPSULATION AND DECAPSULATION
+================================================================================
+
+The basic operation. Sender has the recipient's public key; the
+recipient has the private key.
+
+Sender side:
+
+  let recipient_ek = /* 1184 bytes */;
+
+  // Validate before use if the key came from an untrusted source.
+  let level = validate_encapsulation_key(recipient_ek)?;
+
+  let (ct, shared_secret_sender) = encapsulate_to(recipient_ek)?;
+  // ct is 1088 bytes, shared_secret_sender is 32 bytes.
+
+Recipient side:
+
+  let (ct, shared_secret_recipient) = kp.decapsulate_received(&ct)?;
+
+  assert_eq!(shared_secret_sender, shared_secret_recipient);
+
+`validate_encapsulation_key` performs the FIPS 203 section 7.2
+modulus check. If you skip it, you accept any well-formed byte
+string as a public key, which is not what you want on the wire.
+Call it on every `ek` you receive from a peer.
+
+Decapsulation never fails for a well-formed ciphertext, even if
+the ciphertext is wrong. A tampered ciphertext produces an
+unrelated, deterministic 32-byte value (implicit rejection). The
+only error `decapsulate` returns is for a wrong-length ciphertext.
+
+  // Tampered ciphertext: no error, but a different secret.
+  let mut bad = ct.clone();
+  bad[0] ^= 1;
+  let ss_after_tamper = kp.decapsulate(&bad)?;
+  assert_ne!(ss_after_tamper, shared_secret_recipient);
+
+If you only have the seed, you can decapsulate:
+
+  let kp = MlKemKeyPair::from_seed(&dk_seed)?;
+  let ss = kp.decapsulate(&ct)?;
+
+If you want to check that a decapsulation key is internally
+consistent (embedded ek hash matches the ek):
+
+  let dk = kp.decapsulation_key();
+  if !kem::check_dk_level(kp.level(), dk) {
+      return Err("decapsulation key failed validation".into());
+  }
+
+
+================================================================================
+  4.  SIGNING AND VERIFYING (ML-DSA)
+================================================================================
+
+ML-DSA-65 (default):
+
+  let kp = MlDsaKeyPair::new();
+  let msg = b"the message";
+  let sig = kp.sign(msg);
+  assert_eq!(sig.len(), 3309);
+
+  assert!(kp.verify(msg, &sig));
+  assert!(!kp.verify(b"not the message", &sig));
+
+ML-DSA-87 (CNSA 2.0 level):
+
+  let kp = MlDsa87KeyPair::new();
+  let sig = kp.sign(msg);
+  assert_eq!(sig.len(), 4627);
+
+Export and import:
+
+  let (seed, vk) = kp.export_keys();
+  assert_eq!(seed.len(), 32);   // signing-key seed
+  assert_eq!(vk.len(), 1952);   // ML-DSA-65 verifying key
+
+  let kp = MlDsaKeyPair::import_keys(&seed, &vk)?;
+
+Verifying with only the public key (no private key needed, no
+keypair object needed):
+
+  let vk = /* 1952 or 2592 bytes */;
+  let ok = ml_dsa_verify(vk, msg, sig);
+
+`ml_dsa_verify` infers the parameter set from the key length.
+Returns `false` for anything malformed. Does not panic.
+
+
+================================================================================
+  5.  ENCRYPTING A PRIVATE KEY WITH A PASSPHRASE
+================================================================================
+
+Use this to protect a stored key seed with a user passphrase.
+
+  let kp = MlKemKeyPair::new()?;
+  let (dk_seed, _ek) = kp.export_keys();
+
+  let encrypted = encrypt_private_key(&dk_seed, "correct horse battery staple")?;
+  // Store `encrypted` in a file, a database, wherever.
+
+  // Later:
+  let decrypted = decrypt_private_key(&encrypted, "correct horse battery staple")?;
+  let kp = MlKemKeyPair::from_seed(&decrypted)?;
+
+Wrong passphrase produces an error:
+
+  match decrypt_private_key(&encrypted, "wrong passphrase") {
+      Ok(_)  => unreachable!(),
+      Err(e) => eprintln!("could not decrypt: {e}"),
+  }
+
+Custom Argon2 parameters (only if you have measured on your
+hardware and want to tune):
+
+  let encrypted = encrypt_private_key_with_params(
+      &dk_seed,
+      "correct horse battery staple",
+      131_072,  // m_cost in KiB (128 MiB)
+      4,        // t_cost
+      1,        // p_cost
+  )?;
+
+The parameters are stored in the blob and authenticated, so a
+tampered header cannot weaken the parameters. Decrypt does not
+need to know what parameters were used.
+
+Bounds: `m_cost <= 512 MiB`, `t_cost in [1, 16]`,
+`p_cost in [1, 16]`. Values outside those bounds are rejected at
+encrypt time and at decrypt time.
+
+Note on what a passphrase protects against: it protects the blob
+at rest. It does not protect against a compromised machine, a
+keylogger, or an attacker who observes the passphrase being
+typed. Treat it as one layer, not as the only layer.
+
+
+================================================================================
+  6.  WRAPPING A KEY FOR A RECIPIENT
+================================================================================
+
+You have a symmetric key (a room key, a file key, anything). You
+want to send it to someone who has a KEM public key.
+
+Binary form (self-describing, best for programmatic use):
+
+  let recipient_ek = /* 1184, 1568, 1216, or 1600 bytes */;
+
+  let blob = wrap_key(recipient_ek, b"the-room-key")?;
+  // blob is "CBWK" | 0x01 | kem_ct | nonce | aead_ct.
+
+  // On the recipient side:
+  let recovered = unwrap_key(&kp, &blob)?;
+  assert_eq!(recovered, b"the-room-key");
+
+`wrap_key` accepts either a plain ML-KEM key (1184 or 1568 bytes)
+or a hybrid key (1216 or 1600 bytes). The suite is inferred from
+the key length. The shared secret is combined with a domain-
+separated hash of the ciphertext and the recipient key, so the
+wrapped blob is bound to both.
+
+JSON form (best for interop with a frontend or another service):
+
+  let pk_b64 = base64::engine::general_purpose::STANDARD.encode(recipient_ek);
+
+  let json = wrap_room_key_for_user(&pk_b64, "the-room-key")?;
+  // {"v":2,"ct":"...","iv":"...","enc_aes":"..."}
+
+  // On the recipient side, parse the JSON:
+  let v       = serde_json::from_str::<serde_json::Value>(&json)?;
+  let ct_b64  = v["ct"].as_str().ok_or("missing ct")?;
+  let iv_b64  = v["iv"].as_str().ok_or("missing iv")?;
+  let enc_b64 = v["enc_aes"].as_str().ok_or("missing enc_aes")?;
+
+  let recovered = unwrap_room_key(&kp, 2, ct_b64, iv_b64, enc_b64)?;
+  assert_eq!(recovered, "the-room-key");
+
+`unwrap_room_key` takes the version explicitly (`v["v"]` from the
+JSON). Pass `1` to decrypt a legacy v1 blob. Do not guess — read
+the `v` field.
+
+The recipient side can use a `MlKemKeyPair` or a
+`HybridKeyPair`; both implement the `Decapsulator` trait that
+`unwrap_key` and `unwrap_room_key` accept.
+
+
+================================================================================
+  7.  ENCRYPTING A LARGE FILE
+================================================================================
+
+One-shot API, when the whole plaintext fits in memory:
+
+  let kp = MlKemKeyPair::new()?;
+
+  let plaintext = std::fs::read("input.bin")?;
+  let ciphertext = file::encrypt_file(&plaintext, kp.encapsulation_key(), 65536)?;
+  std::fs::write("output.cbox", &ciphertext)?;
+
+  // Decrypt:
+  let ciphertext = std::fs::read("output.cbox")?;
+  let plaintext  = file::decrypt_file(&ciphertext, kp.decapsulation_key())?;
+  std::fs::write("recovered.bin", &plaintext)?;
+
+Chunk size: 65536 is the default. The minimum is 64 bytes, the
+maximum is 1048576 bytes. Larger chunks are faster; smaller
+chunks give finer truncation detection granularity. There is no
+correct answer for every workload — pick something between 64 KiB
+and 1 MiB and measure.
+
+If you only have the seed:
+
+  let plaintext = file::decrypt_file_with_seed(&ciphertext, &dk_seed)?;
+
+If the file was encrypted to a hybrid public key:
+
+  let plaintext = file::decrypt_file_with_hybrid_secret(&ciphertext, &hybrid.export_secret())?;
+
+Errors are specific. Every failure mode from the format spec has
+a distinct error string:
+
+  "bad magic"
+  "unsupported version: 0x.."
+  "unknown suite id 0x.."
+  "chunk_size ... outside allowed range [...]"
+  "chunk N failed to authenticate"
+  "last chunk failed to authenticate (truncation or wrong key)"
+  "incomplete header"
+  "file was encrypted for X but the key is Y"
+  "file was encrypted for X: a hybrid key is required"
+
+If you get "chunk N failed to authenticate" for N > 0, the file was
+tampered with after chunk N-1. If you get "last chunk failed to
+authenticate", the file was either truncated or encrypted to a
+different key.
+
+Partial plaintext is never written. If `decrypt_file` returns
+`Err`, the file you were decrypting is either untouched or you
+wrote nothing. On a streaming decryptor, the caller decides
+whether to keep the partial output — the crate does not write it
+anywhere on its own.
+
+
+================================================================================
+  8.  STREAMING A LARGE FILE
+================================================================================
+
+When the file does not fit in memory, use the streaming API. Both
+encryptor and decryptor accept arbitrary-sized slices.
+
+Encrypting:
+
+  use std::io::{Read, Write};
+
+  let mut input  = std::fs::File::open("large.bin")?;
+  let mut output = std::fs::File::create("large.cbox")?;
+
+  let mut enc = file::FileEncryptor::new(kp.encapsulation_key(), 65536)?;
+
+  let mut in_buf  = vec![0u8; 65536];
+  let mut out_buf = Vec::with_capacity(65536 + 32);
+
+  loop {
+      let n = input.read(&mut in_buf)?;
+      if n == 0 { break; }
+
+      out_buf.clear();
+      enc.update(&in_buf[..n], &mut out_buf)?;
+      if !out_buf.is_empty() {
+          output.write_all(&out_buf)?;
+      }
+  }
+
+  out_buf.clear();
+  enc.finish(&mut out_buf)?;
+  output.write_all(&out_buf)?;
+
+Decrypting:
+
+  let mut dec = file::FileDecryptor::new(kp.decapsulation_key())?;
+  // Or: FileDecryptor::from_seed(&dk_seed)?
+  // Or: FileDecryptor::from_hybrid_secret(&secret)?
+
+  let mut in_buf  = vec![0u8; 65536];
+  let mut out_buf = Vec::with_capacity(65536);
+
+  loop {
+      let n = input.read(&mut in_buf)?;
+      if n == 0 { break; }
+
+      out_buf.clear();
+      dec.update(&in_buf[..n], &mut out_buf)?;
+      if !out_buf.is_empty() {
+          output.write_all(&out_buf)?;
+      }
+  }
+
+  out_buf.clear();
+  dec.finish(&mut out_buf)?;
+  output.write_all(&out_buf)?;
+
+The streaming decryptor buffers internally until it has a full
+header and at least one full chunk. That means the first `update`
+call may produce no output at all — that is normal. The header is
+between 5 and 1606 bytes depending on the suite and format
+version, so the first output appears after roughly one header
+plus one chunk of input has been fed in.
+
+Every possible split point across `update` calls produces the
+same ciphertext and the same plaintext. The crate tests this
+exhaustively. You do not need to align your reads to chunk
+boundaries.
+
+Important: `dec.update` will fail as soon as it detects a
+tampered chunk. If you have already written earlier chunks to
+your output file, those are on disk. Decide whether to delete
+the output file on error, or to write to a temporary file and
+rename on success — the crate does not make this decision for you.
+
+
+================================================================================
+  9.  HYBRID KEYS
+================================================================================
+
+A hybrid key pair combines X25519 and ML-KEM. It is secure if
+either of the two holds.
+
+  let kp = HybridKeyPair::new(KemLevel::MlKem768)?;
+
+  println!("public key: {} bytes", kp.public_key().len()); // 1216
+
+  // Encapsulate to the public key:
+  let (ct, ss_sender) = cipherbox_pqc_core::encapsulate_hybrid_to(kp.public_key())?;
+
+  // Decapsulate:
+  let ss_recipient = kp.decapsulate(&ct)?;
+  assert_eq!(ss_sender, ss_recipient);
+
+Export and import:
+
+  let secret = kp.export_secret();
+  // 34 bytes: version | level id | 32-byte seed.
+  // Store this encrypted.
+
+  let kp = HybridKeyPair::from_seed(&seed32, level)?;
+  let kp = HybridKeyPair::from_secret(&secret)?;
+
+Using hybrid keys with `wrap_key`, `unwrap_key`,
+`wrap_room_key_for_user`, and `encrypt_file` works the same way
+as with plain ML-KEM keys — the suite is inferred from the
+public-key length. A file encrypted to a hybrid key cannot be
+decrypted with a plain ML-KEM key of the same level and vice
+versa, which the crate enforces at the header check.
+
+To inspect what a given public key is:
+
+  let suite = validate_public_key(public_key)?;
+  println!("{}", suite.name());  // "ML-KEM-768", "X25519+ML-KEM-768", etc.
+
+
+================================================================================
+ 10.  ROOMS: GROUP MESSAGING FROM A SHARED SECRET
+================================================================================
+
+A room is a group whose members all share a secret that is
+established out of band — a passphrase, the hash of a photo, a
+QR code, or several of these combined. No server-side member
+list or invitation is needed.
+
+Creating a room secret:
+
+  use cipherbox_pqc_core::room::{RoomSecret, RoomKdfParams};
+
+  let secret = RoomSecret::derive(
+      "team-alpha",                              // context
+      &[b"correct horse battery staple"],        // sources
+      RoomKdfParams::DEFAULT,
+  )?;
+
+  println!("room id: {}", hex(secret.room_id()));
+
+The context separates unrelated rooms that share the same
+sources. Use something stable (the room's name, the server's
+name, a project label). Do not use something that changes, or
+the room id will change.
+
+Joining:
+
+  use cipherbox_pqc_core::room::Room;
+
+  let mut room = Room::join(&secret)?;
+  // Each call to Room::join generates a fresh random sender id.
+
+  // Or, if you want a specific id:
+  let mut room = Room::join_with_sender_id(&secret, [0x01; 16]);
+
+Sending an unsigned message:
+
+  let envelope = room.seal(b"hello")?;
+  // Send `envelope` to the other members over whatever channel.
+
+Receiving:
+
+  let opened = room.open(&envelope, None)?;
+  println!("from {}: {}", hex(&opened.sender_id), String::from_utf8_lossy(&opened.plaintext));
+
+Sender id and index:
+
+  The `Opened` struct includes `sender_id` (16 bytes), `epoch`
+  (u32), `index` (u32), and `signed` (bool). Use them to
+  distinguish senders and to detect replays (the same
+  `(sender_id, epoch, index)` should only be opened once per
+  room instance).
+
+Signing messages:
+
+  let dsa = MlDsaKeyPair::new();
+  let (_, vk) = dsa.export_keys();
+
+  let envelope = room.seal_signed(b"hello", &|m| dsa.sign(m))?;
+
+  // On the receiving side, pass a verifier:
+  let verify = |m: &[u8], sig: &[u8]| ml_dsa_verify(&vk, m, sig);
+  let opened = room.open(&envelope, Some(&verify))?;
+
+If you pass a verifier to `open`, the message must be signed and
+the signature must verify, or `open` returns an error before
+touching any ratchet state. If you pass `None`, unsigned and
+signed messages both work, and the `signed` field tells you
+which one you received.
+
+What a room does and does not give you:
+
+  Gives you:
+    - Forward secrecy against compromise of a device, as long as
+      the root secret is not also compromised.
+    - Replay and reordering detection.
+    - Optional sender authentication with ML-DSA.
+    - Post-compromise security after a rekey.
+
+  Does NOT give you:
+    - Forward secrecy against leak of the root secret. Anyone
+      who learns the passphrase can derive epoch 0 and, if they
+      also recorded the traffic, decrypt everything up to the
+      first rekey. Use `rekey` to close this.
+    - Sender authentication without a signature. Without a
+      signature, any holder of the root can send a message
+      that claims to be from any sender id.
+
+
+================================================================================
+ 11.  ROOMS: ADDING A MEMBER (REKEY)
+================================================================================
+
+Rekeying moves the room to a new epoch with fresh randomness
+that is wrapped to each member's KEM public key. After a rekey,
+the room stays secret even if the root secret later leaks.
+
+You need:
+  - A member's KEM public key (plain or hybrid, any level, any
+    suite — mixed levels are allowed within a rekey).
+  - A signer that the other members already trust.
+
+  let bob_public_key = /* 1184, 1568, 1216, or 1600 bytes */;
+  let alice_dsa = MlDsaKeyPair::new();
+  let (_, alice_vk) = alice_dsa.export_keys();
+
+  let bundle = room.rekey(
+      &[bob_public_key],
+      &|m| alice_dsa.sign(m),
+  )?;
+
+  // `bundle` is a RekeyBundle. Send it to the other members.
+  // Or serialize it for the wire:
+  let bytes = bundle.to_bytes();
+
+The bundle is not secret — it is signed, and its contents are
+encrypted to each member's KEM public key. You can relay it
+through an untrusted server.
+
+On the other side:
+
+  let bundle = RekeyBundle::from_bytes(&bytes)?;
+
+  let verify = |m: &[u8], sig: &[u8]| ml_dsa_verify(&alice_vk, m, sig);
+
+  room.apply_rekey(&bundle, &bob_kem_keypair, &verify)?;
+
+`bob_kem_keypair` is the receiving member's key pair — a
+`MlKemKeyPair` or a `HybridKeyPair`, both work. The key pair is
+used to unwrap the fresh seed from the entry that matches its
+public-key fingerprint.
+
+Ordering:
+
+  The bundle's epoch must be exactly one more than the newest
+  epoch the receiving member knows. `apply_rekey` rejects
+  skipped or replayed bundles. If two members rekey concurrently,
+  the relay must serialise them (first one wins).
+
+The member who creates the rekey bundle should not include their
+own public key in `member_public_keys`. They already have the
+new epoch key from having generated it.
+
+Forgetting old epochs:
+
+  By default the room keeps all epoch keys it has ever seen.
+  After a rekey has been delivered to everyone, delete the old
+  ones:
+
+  room.forget_epochs_before(new_epoch);
+
+  Messages from forgotten epochs can no longer be decrypted.
+  That is what makes old epochs forward-secret. Do not call this
+  until you are sure no in-flight messages from the old epoch
+  are still needed.
+
+
+================================================================================
+ 12.  PERSISTING ROOM STATE
+================================================================================
+
+Room state is secret and must be persisted encrypted.
+
+  // Export:
+  let state = room.export_state();
+  let encrypted = encrypt_private_key(&state, passphrase)?;
+  std::fs::write("room.state.enc", &encrypted)?;
+
+  // Import:
+  let encrypted = std::fs::read("room.state.enc")?;
+  let state     = decrypt_private_key(&encrypted, passphrase)?;
+  let mut room  = Room::import_state(&state)?;
+
+State includes:
+  - room id
+  - sender id
+  - current epoch
+  - all epoch keys the room has seen
+  - the send chain (current send index and chain key)
+  - every receive chain, including the skipped-key window
+
+Restoring state restores the ability to open messages from the
+same positions as before. Do not open the same envelope in two
+different copies of a restored room — one of them will fail
+because the chain state has advanced.
+
+If you lose the state, you cannot decrypt any messages from
+before the loss, even with the root secret. That is the forward
+secrecy property working as designed.
+
+
+================================================================================
+ 13.  COMMON MISTAKES
+================================================================================
+
+Using a public key without validating it.
+
+  Every `ek` that came from the network should go through
+  `validate_encapsulation_key` or `validate_public_key` first.
+  Without the check, you accept any well-formed byte string as
+  a public key.
+
+Reusing a seed across levels.
+
+  MlKemKeyPair::from_seed(&seed) always produces ML-KEM-768.
+  If you want ML-KEM-1024, use from_seed_with_level. There is
+  no way to tell from the seed itself.
+
+Mixing `wrap_room_key_for_user` and `unwrap_room_key` versions.
+
+  The JSON has a `v` field. Read it and pass it to
+  `unwrap_room_key`. Passing 2 for a legacy blob, or 1 for a v2
+  blob, produces a "wrong key or tampered data" error. That is
+  by design — the versions are not interchangeable.
+
+Using `MlKemKeyPair::encapsulate` to send to a peer.
+
+  `kp.encapsulate()` uses the key pair's own public key. To send
+  to a peer, use `encapsulate_to(peer_ek)`. The method exists
+  for tests and for the case where a key pair encapsulates to
+  itself.
+
+Ignoring the signature on a rekey bundle.
+
+  `apply_rekey` takes a verifier. Do not pass a verifier that
+  always returns true, and do not pass a verifier for a key you
+  have not authenticated out of band. The rekey's security
+  depends entirely on the trustworthiness of the verifying key.
+
+Opening the same envelope twice.
+
+  The second call fails with "message already received or too
+  old." That is correct. If you need at-least-once delivery,
+  deduplicate on your side.
+
+Streaming decryptor with output already on disk.
+
+  If you write chunk N to a file, then chunk N+1 fails
+  authentication, you have a partial plaintext on disk. The
+  crate does not clean it up. Either delete the output on error,
+  or write to a temporary file and rename on success.
+
+Skipping `forget_epochs_before` after a rekey.
+
+  Until you call `forget_epochs_before`, every epoch key is
+  retained in memory and in any exported state. That defeats
+  the forward secrecy that rekey is supposed to provide.
+  Call it after all members have confirmed the new epoch.
+
+
+================================================================================
+ 14.  WHERE TO GO NEXT
+================================================================================
+
+Read README.md section 4 before deploying anything. It describes
+the trust barriers (not audited, not ACVP-validated) and the
+threat-model boundaries (no constant-time analysis on the
+compiled binary) that you need to decide about before using this
+crate in production.
+
+Read README.md sections 6, 7, and 8 for the exact wire formats of
+the hybrid KEM, the room envelope, and the file format, if you
+are implementing a peer in another language.
+
+Run `cargo doc --open` for the full rustdoc, including every
+method signature and every type.
+
+Run `cargo test --all-targets` to see the 80-test suite pass on
+your machine.
+
+If you have a use case the crate does not cover, the RustCrypto
+ml-kem crate is the right choice for ML-KEM and the ml-dsa crate
+is the right choice for signatures.
