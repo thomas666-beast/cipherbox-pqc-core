@@ -1,8 +1,7 @@
 [package]
 name = "cipherbox-pqc-core"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
-rust-version = "1.87"
 authors = ["Thomas <selfworker112@mailfence.com>"]
 description = "From-scratch post-quantum cryptography core: ML-KEM-768/1024, X25519 hybrid KEM, secret-derived rooms with ratchet, Keccak, chunked file encryption (unaudited)"
 license = "MIT"
