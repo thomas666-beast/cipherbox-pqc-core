@@ -38,7 +38,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const MAGIC: &[u8; 4] = b"CBOX";
 /// Legacy format (ML-KEM-768 only).
@@ -56,6 +56,7 @@ pub const CHUNK_SIZE_MAX: usize = 1024 * 1024;
 const KDF_DOMAIN_V1: &[u8] = b"cipherbox-file-v1";
 const KDF_DOMAIN_V2: &[u8] = b"cipherbox-file-v2";
 const CHUNK_AAD: &[u8] = b"CBOX-v1-chunk";
+const MAX_HEADER_BYTES: usize = 10 + Suite::Hybrid(KemLevel::MlKem1024).ct_bytes();
 
 /// Format version used when writing a file for `suite`.
 fn version_for(suite: Suite) -> u8 {
@@ -170,7 +171,11 @@ impl FileEncryptor {
         })
     }
 
-    pub fn update(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> Result<(), CipherboxError> {
+    pub fn update(
+        &mut self,
+        mut plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), CipherboxError> {
         if self.finished {
             return Err(CipherboxError::Crypto("encryptor already finished".into()));
         }
@@ -178,24 +183,23 @@ impl FileEncryptor {
             out.extend_from_slice(&self.header);
             self.header_written = true;
         }
-        self.buffer.extend_from_slice(plaintext);
-        while self.buffer.len() >= self.chunk_size {
-            let nonce_bytes = build_nonce(self.counter, false);
-            let nonce = Nonce::from_slice(&nonce_bytes);
-            let ct = self
-                .cipher
-                .encrypt(
-                    nonce,
-                    Payload {
-                        msg: &self.buffer[..self.chunk_size],
-                        aad: CHUNK_AAD,
-                    },
-                )
-                .map_err(|e| CipherboxError::Crypto(format!("encrypt: {e:?}")))?;
-            out.extend_from_slice(&ct);
-            self.buffer.drain(..self.chunk_size);
-            self.counter = bump(self.counter)?;
+        if !self.buffer.is_empty() {
+            let n = plaintext.len().min(self.chunk_size - self.buffer.len());
+            self.buffer.extend_from_slice(&plaintext[..n]);
+            plaintext = &plaintext[n..];
+            if self.buffer.len() < self.chunk_size {
+                return Ok(());
+            }
+            self.counter = encrypt_full(&self.cipher, self.counter, &self.buffer, out)?;
+            self.buffer.as_mut_slice().zeroize();
+            self.buffer.clear();
         }
+        while plaintext.len() >= self.chunk_size {
+            let (chunk, rest) = plaintext.split_at(self.chunk_size);
+            self.counter = encrypt_full(&self.cipher, self.counter, chunk, out)?;
+            plaintext = rest;
+        }
+        self.buffer.extend_from_slice(plaintext);
         Ok(())
     }
 
@@ -220,10 +224,30 @@ impl FileEncryptor {
             )
             .map_err(|e| CipherboxError::Crypto(format!("encrypt: {e:?}")))?;
         out.extend_from_slice(&ct);
-        self.buffer.clear();
+        self.buffer.zeroize();
         self.finished = true;
         Ok(())
     }
+}
+
+fn encrypt_full(
+    cipher: &ChaCha20Poly1305,
+    counter: u64,
+    chunk: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<u64, CipherboxError> {
+    let next = bump(counter)?;
+    let ct = cipher
+        .encrypt(
+            Nonce::from_slice(&build_nonce(counter, false)),
+            Payload {
+                msg: chunk,
+                aad: CHUNK_AAD,
+            },
+        )
+        .map_err(|e| CipherboxError::Crypto(format!("encrypt: {e:?}")))?;
+    out.extend_from_slice(&ct);
+    Ok(next)
 }
 
 impl Drop for FileEncryptor {
@@ -253,6 +277,7 @@ pub struct FileDecryptor {
     counter: u64,
     buffer: Vec<u8>,
     header_parsed: bool,
+    failed: bool,
 }
 
 impl FileDecryptor {
@@ -304,6 +329,7 @@ impl FileDecryptor {
             counter: 0,
             buffer: Vec::new(),
             header_parsed: false,
+            failed: false,
         }
     }
 
@@ -398,44 +424,66 @@ impl FileDecryptor {
         Ok(())
     }
 
+    /// Release individually authenticated non-final chunks. The caller must
+    /// stage this output and discard it on error; only `finish` authenticates
+    /// the complete stream and detects truncation at a chunk boundary.
     pub fn update(&mut self, ciphertext: &[u8], out: &mut Vec<u8>) -> Result<(), CipherboxError> {
-        self.buffer.extend_from_slice(ciphertext);
-        self.try_parse_header()?;
+        if self.failed {
+            return Err(CipherboxError::Crypto("decryptor failed".into()));
+        }
+        let len = out.len();
+        let result = self.update_inner(ciphertext, out);
+        if result.is_err() {
+            out[len..].zeroize();
+            out.truncate(len);
+            self.failed = true;
+        }
+        result
+    }
+
+    fn update_inner(&mut self, mut input: &[u8], out: &mut Vec<u8>) -> Result<(), CipherboxError> {
         if !self.header_parsed {
-            return Ok(());
+            let n = input.len().min(MAX_HEADER_BYTES - self.buffer.len());
+            self.buffer.extend_from_slice(&input[..n]);
+            input = &input[n..];
+            self.try_parse_header()?;
+            if !self.header_parsed {
+                return Ok(());
+            }
         }
         let ct_full = self.chunk_size + TAG_BYTES;
+        let cipher = self
+            .cipher
+            .as_ref()
+            .ok_or_else(|| CipherboxError::Crypto("cipher not initialized".into()))?;
+        // The initial header buffer may contain some of the first chunks.
         while self.buffer.len() > ct_full {
-            let pt = {
-                let cipher = self
-                    .cipher
-                    .as_ref()
-                    .ok_or_else(|| CipherboxError::Crypto("cipher not initialized".into()))?;
-                let nonce_bytes = build_nonce(self.counter, false);
-                let nonce = Nonce::from_slice(&nonce_bytes);
-                cipher
-                    .decrypt(
-                        nonce,
-                        Payload {
-                            msg: &self.buffer[..ct_full],
-                            aad: CHUNK_AAD,
-                        },
-                    )
-                    .map_err(|_| {
-                        CipherboxError::Crypto(format!(
-                            "chunk {} failed to authenticate",
-                            self.counter
-                        ))
-                    })?
-            };
-            out.extend_from_slice(&pt);
+            self.counter = decrypt_full(cipher, self.counter, &self.buffer[..ct_full], out)?;
             self.buffer.drain(..ct_full);
-            self.counter = bump(self.counter)?;
         }
+        if !self.buffer.is_empty() {
+            let n = input.len().min(ct_full - self.buffer.len());
+            self.buffer.extend_from_slice(&input[..n]);
+            input = &input[n..];
+            if input.is_empty() {
+                return Ok(());
+            }
+            self.counter = decrypt_full(cipher, self.counter, &self.buffer, out)?;
+            self.buffer.clear();
+        }
+        while input.len() > ct_full {
+            let (chunk, rest) = input.split_at(ct_full);
+            self.counter = decrypt_full(cipher, self.counter, chunk, out)?;
+            input = rest;
+        }
+        self.buffer.extend_from_slice(input);
         Ok(())
     }
 
     pub fn finish(mut self, out: &mut Vec<u8>) -> Result<(), CipherboxError> {
+        if self.failed {
+            return Err(CipherboxError::Crypto("decryptor failed".into()));
+        }
         self.try_parse_header()?;
         if !self.header_parsed {
             return Err(CipherboxError::Crypto("incomplete header".into()));
@@ -454,7 +502,7 @@ impl FileDecryptor {
                 "last chunk larger than declared chunk_size".into(),
             ));
         }
-        let pt = {
+        let pt = Zeroizing::new({
             let cipher = self
                 .cipher
                 .as_ref()
@@ -474,11 +522,35 @@ impl FileDecryptor {
                         "last chunk failed to authenticate (truncation or wrong key)".into(),
                     )
                 })?
-        };
+        });
         out.extend_from_slice(&pt);
         self.cipher = None;
         Ok(())
     }
+}
+
+fn decrypt_full(
+    cipher: &ChaCha20Poly1305,
+    counter: u64,
+    chunk: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<u64, CipherboxError> {
+    let next = bump(counter)?;
+    let pt = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(&build_nonce(counter, false)),
+                Payload {
+                    msg: chunk,
+                    aad: CHUNK_AAD,
+                },
+            )
+            .map_err(|_| {
+                CipherboxError::Crypto(format!("chunk {counter} failed to authenticate"))
+            })?,
+    );
+    out.extend_from_slice(&pt);
+    Ok(next)
 }
 
 impl Drop for FileDecryptor {
@@ -511,19 +583,19 @@ pub fn encrypt_file(
 /// Decrypt with a full decapsulation key (768 or 1024).
 pub fn decrypt_file(ciphertext: &[u8], recipient_dk: &[u8]) -> Result<Vec<u8>, CipherboxError> {
     let mut dec = FileDecryptor::new(recipient_dk)?;
-    let mut out = Vec::new();
+    let mut out = Zeroizing::new(Vec::new());
     dec.update(ciphertext, &mut out)?;
     dec.finish(&mut out)?;
-    Ok(out)
+    Ok(std::mem::take(&mut *out))
 }
 
 /// Decrypt with the 64-byte seed; the level is taken from the file header.
 pub fn decrypt_file_with_seed(ciphertext: &[u8], seed: &[u8]) -> Result<Vec<u8>, CipherboxError> {
     let mut dec = FileDecryptor::from_seed(seed)?;
-    let mut out = Vec::new();
+    let mut out = Zeroizing::new(Vec::new());
     dec.update(ciphertext, &mut out)?;
     dec.finish(&mut out)?;
-    Ok(out)
+    Ok(std::mem::take(&mut *out))
 }
 
 /// Decrypt with the 34-byte secret of a hybrid key pair.
@@ -532,8 +604,8 @@ pub fn decrypt_file_with_hybrid_secret(
     secret: &[u8],
 ) -> Result<Vec<u8>, CipherboxError> {
     let mut dec = FileDecryptor::from_hybrid_secret(secret)?;
-    let mut out = Vec::new();
+    let mut out = Zeroizing::new(Vec::new());
     dec.update(ciphertext, &mut out)?;
     dec.finish(&mut out)?;
-    Ok(out)
+    Ok(std::mem::take(&mut *out))
 }

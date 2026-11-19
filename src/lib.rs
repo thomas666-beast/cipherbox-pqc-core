@@ -293,7 +293,7 @@ macro_rules! define_ml_dsa {
             }
 
             pub fn export_keys(&self) -> (Vec<u8>, Vec<u8>) {
-                let seed = self.sk.to_seed();
+                let seed = zeroize::Zeroizing::new(self.sk.to_seed());
                 let vk_bytes = self.vk.encode();
                 (seed.to_vec(), vk_bytes.as_slice().to_vec())
             }
@@ -320,10 +320,12 @@ macro_rules! define_ml_dsa {
                     .map_err(|_| CipherboxError::Crypto("invalid seed".into()))?;
                 let sk = SigningKey::<$param>::from_seed(seed_arr);
 
-                let vk_arr: &ml_dsa::EncodedVerifyingKey<$param> = vk_bytes
-                    .try_into()
-                    .map_err(|_| CipherboxError::Crypto("invalid vk length".into()))?;
-                let vk = VerifyingKey::<$param>::decode(vk_arr);
+                let vk = sk.verifying_key();
+                if vk.encode().as_slice() != vk_bytes {
+                    return Err(CipherboxError::Crypto(
+                        "ML-DSA verifying key does not match the signing seed".into(),
+                    ));
+                }
 
                 Ok(Self { sk, vk })
             }

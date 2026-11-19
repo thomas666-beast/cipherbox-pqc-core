@@ -2,6 +2,7 @@
 name = "cipherbox-pqc-core"
 version = "0.7.0"
 edition = "2024"
+rust-version = "1.87"
 authors = ["Thomas <selfworker112@mailfence.com>"]
 description = "From-scratch post-quantum cryptography core: ML-KEM-768/1024, X25519 hybrid KEM, secret-derived rooms with ratchet, Keccak, chunked file encryption (unaudited)"
 license = "MIT"
@@ -11,7 +12,7 @@ categories = ["cryptography"]
 
 [dependencies]
 getrandom = "0.2"
-ml-dsa = "=0.1.2"
+ml-dsa = { version = "=0.1.2", features = ["zeroize"] }
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
 base64 = "0.22"

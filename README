@@ -4,7 +4,7 @@
 
              From-scratch post-quantum cryptography for servers:
              ML-KEM-768 / ML-KEM-1024, X25519 hybrid KEM, secret-
-             derived rooms with a forward-secure ratchet, Keccak,
+             derived rooms with a per-sender ratchet, Keccak,
              and chunked large-file encryption.
 
                           Version 0.7.0  |  MIT License
@@ -47,10 +47,9 @@ A single Rust crate that provides, for server-side use:
 
   - A secret-derived "room" protocol: a group key derived from
     passphrases or other out-of-band sources via Argon2id, with
-    a forward-secure symmetric ratchet, optional ML-DSA signatures
-    on messages, and a rekey mechanism that upgrades a room to
-    post-compromise security by wrapping fresh randomness to
-    members' KEM public keys.
+    per-sender symmetric ratchets, optional ML-DSA signatures
+    on messages, and a rekey mechanism that wraps fresh
+    randomness to members' KEM public keys.
 
   - Chunked large-file encryption using the STREAM construction,
     with format v1 (ML-KEM-768 only) and v2 (any suite: ML-KEM-768,
@@ -107,7 +106,7 @@ NEW IN 0.7.0
     Per-sender hash chains with a bounded skip window. Optional
     ML-DSA signatures on messages and on rekey bundles. Rekey
     injects fresh randomness wrapped to members' KEM public keys,
-    so a leaked passphrase does not compromise future epochs.
+    which can protect later epochs against a root-only leak.
 
   - File format v2. Records the suite id in the header so that
     ML-KEM-1024 and hybrid files are distinguishable from the
@@ -202,7 +201,7 @@ WRITTEN FROM SCRATCH IN THIS CRATE
       Chunked file encryption (STREAM). See section 8.
 
   room.rs
-      Secret-derived rooms with a forward-secure ratchet.
+      Secret-derived rooms with a per-sender ratchet.
       See section 7.
 
   lib.rs
@@ -279,9 +278,9 @@ protect against
       depend on a passphrase or an out-of-band source. If that
       secret leaks, an attacker who recorded traffic can decrypt
       epoch 0 of a room and any blob encrypted with that
-      passphrase. Room::rekey upgrades a room to post-compromise
-      security for later epochs, but only if the rekey happens
-      before the attacker uses the leaked secret.
+      passphrase. Room::rekey can protect later epochs against
+      a root-only leak if recipient and signing keys stay safe
+      and the recipient roster stays authentic.
 
 SCOPE - these are absent by design, not by omission
 
@@ -592,10 +591,9 @@ Messages:
   nonce_n    = H("msg-nonce", chain_n)[..12]
   chain_n+1  = H("chain-next", chain_n)
 
-Each message key is used once and the chain key is overwritten
-after use. A device compromised later cannot decrypt messages it
-already processed, provided the root secret itself was not
-retained or leaked.
+The chain key advances after use, but a retained epoch key can
+reconstruct every message key in its epoch. The room id permits
+offline guessing of low-entropy root inputs.
 
 Ratchet state advances only after a message authenticates, so
 garbage cannot be used to burn message keys. Skipped messages are
@@ -604,22 +602,18 @@ are refused rather than buffered.
 
 Forward secrecy properties:
 
-  Against state compromise: yes.
-
-  Against leak of the root secret (a stolen passphrase): no. That
-  is inherent to secret-derived rooms. Use Room::rekey to inject
-  fresh randomness wrapped to members' KEM public keys; later
-  epochs then stay secret even if the root leaks. This is
-  post-compromise security and is the reason the rekey function
-  exists.
+  There is no intra-epoch forward secrecy against state compromise.
+  A root leak also exposes epoch 0. Rekey can protect newer
+  epochs against a root-only leak. Erasure of older epochs only
+  helps if keys cannot be recovered from other material, including
+  old snapshots or recorded rekeys and recipient keys.
 
 Sender authenticity:
 
-  Optional. seal_signed attaches an ML-DSA signature to the
-  envelope. open with a verifier rejects unsigned messages and
-  messages whose signature does not verify, before any ratchet
-  state is touched. Without signatures, any holder of the root
-  can impersonate any sender id.
+  Use seal_signed and open_from with the expected sender id and
+  its pinned ML-DSA key. The signed flag alone is not trustworthy;
+  inspect signature_verified. Unverified mode authenticates only
+  possession of the room epoch key, not the sender.
 
 Envelope format (version 1):
 
@@ -863,25 +857,9 @@ RustCrypto ml-kem
 Polynom
 -------
 
-  Polynom is a closed-source collaboration platform that uses
-  Kyber-1024 and Dilithium5, plus a proprietary entropy-based
-  key exchange layer. It is a complete product (chat, rooms,
-  file sharing, mobile apps). This crate is a toolkit: a KEM,
-  a hybrid, a file format, and a room protocol. Different users,
-  different trust model.
-
-  Where this crate differs from Polynom:
-    - Uses ML-KEM-768 (Level III) as the default, with
-      ML-KEM-1024 available.
-    - Uses ChaCha20-Poly1305 instead of AES-256-GCM.
-    - Publishes KAT vectors generated from independent
-      implementations.
-    - Publishes the file and room formats.
-
-  Where Polynom differs from this crate:
-    - Is a complete product with a UI and network protocols.
-    - Uses a proprietary entropy layer that is not a NIST
-      standard.
+  See ../SECURITY-UPGRADE.md for the sourced comparison and
+  limits. A library and a deployed collaboration platform
+  cannot be ranked by primitive choices alone.
 
 liboqs
 ------
@@ -900,7 +878,7 @@ liboqs
 
 Requirements:
 
-  Rust 1.85 or later (edition 2024).
+  Rust 1.87 or later (edition 2024).
   No C compiler, no system libraries.
 
 Build:

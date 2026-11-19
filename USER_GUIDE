@@ -517,7 +517,8 @@ Receiving:
 Sender id and index:
 
   The `Opened` struct includes `sender_id` (16 bytes), `epoch`
-  (u32), `index` (u32), and `signed` (bool). Use them to
+  (u32), `index` (u32), `signed` and `signature_verified`. Use
+  `signature_verified` for the verification result, and use the ids to
   distinguish senders and to detect replays (the same
   `(sender_id, epoch, index)` should only be opened once per
   room instance).
@@ -529,9 +530,8 @@ Signing messages:
 
   let envelope = room.seal_signed(b"hello", &|m| dsa.sign(m))?;
 
-  // On the receiving side, pass a verifier:
-  let verify = |m: &[u8], sig: &[u8]| ml_dsa_verify(&vk, m, sig);
-  let opened = room.open(&envelope, Some(&verify))?;
+  // On the receiving side, use the sender id and key from a trusted roster:
+  let opened = room.open_from(&envelope, &pinned_sender_id, &vk)?;
 
 If you pass a verifier to `open`, the message must be signed and
 the signature must verify, or `open` returns an error before
@@ -542,17 +542,13 @@ which one you received.
 What a room does and does not give you:
 
   Gives you:
-    - Forward secrecy against compromise of a device, as long as
-      the root secret is not also compromised.
-    - Replay and reordering detection.
-    - Optional sender authentication with ML-DSA.
-    - Post-compromise security after a rekey.
+    - Replay detection with intact state and bounded out-of-order delivery.
+    - Sender authentication against a pinned ML-DSA key.
+    - Rekeying that can isolate new epochs from a root-only leak.
 
   Does NOT give you:
-    - Forward secrecy against leak of the root secret. Anyone
-      who learns the passphrase can derive epoch 0 and, if they
-      also recorded the traffic, decrypt everything up to the
-      first rekey. Use `rekey` to close this.
+    - Forward secrecy inside a retained epoch. State compromise can
+      expose any retained epoch. Root compromise exposes epoch 0.
     - Sender authentication without a signature. Without a
       signature, any holder of the root can send a message
       that claims to be from any sender id.
@@ -563,8 +559,9 @@ What a room does and does not give you:
 ================================================================================
 
 Rekeying moves the room to a new epoch with fresh randomness
-that is wrapped to each member's KEM public key. After a rekey,
-the room stays secret even if the root secret later leaks.
+wrapped to each authorized member's KEM public key. Recovery
+depends on an authentic roster and uncompromised recipient and
+signing keys; it does not heal a compromised endpoint by itself.
 
 You need:
   - A member's KEM public key (plain or hybrid, any level, any
@@ -620,27 +617,29 @@ Forgetting old epochs:
 
   room.forget_epochs_before(new_epoch);
 
-  Messages from forgotten epochs can no longer be decrypted.
-  That is what makes old epochs forward-secret. Do not call this
-  until you are sure no in-flight messages from the old epoch
-  are still needed.
+  This instance will reject forgotten epochs. Old backups and
+  other material may still reconstruct the keys. Do not call
+  this until required in-flight messages have been handled.
 
 
 ================================================================================
  12.  PERSISTING ROOM STATE
 ================================================================================
 
-Room state is secret and must be persisted encrypted.
+Room state is secret. Use a random 32-byte device storage key
+kept separately, preferably in an OS-backed keystore.
 
   // Export:
-  let state = room.export_state();
-  let encrypted = encrypt_private_key(&state, passphrase)?;
-  std::fs::write("room.state.enc", &encrypted)?;
+  let encrypted = room.export_encrypted_state(&device_key)?;
+  // Persist the encrypted blob atomically.
 
   // Import:
   let encrypted = std::fs::read("room.state.enc")?;
-  let state     = decrypt_private_key(&encrypted, passphrase)?;
-  let mut room  = Room::import_state(&state)?;
+  let mut room = Room::restore_encrypted_state(
+      &encrypted, &device_key, &trusted_room_id, trusted_minimum_epoch,
+  )?;
+  // Authenticate the new sender id before sending. Prevent stale snapshots
+  // from being restored, especially within a single epoch.
 
 State includes:
   - room id
@@ -714,9 +713,8 @@ Streaming decryptor with output already on disk.
 Skipping `forget_epochs_before` after a rekey.
 
   Until you call `forget_epochs_before`, every epoch key is
-  retained in memory and in any exported state. That defeats
-  the forward secrecy that rekey is supposed to provide.
-  Call it after all members have confirmed the new epoch.
+  retained in memory and in any exported state. Retire old epochs
+  once the new epoch is confirmed, and review backup retention.
 
 
 ================================================================================

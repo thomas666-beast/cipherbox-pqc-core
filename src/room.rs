@@ -1,4 +1,4 @@
-//! Secret-derived rooms with a forward-secure symmetric ratchet.
+//! Secret-derived rooms with per-sender symmetric ratchets.
 //!
 //! A *room* is identified and keyed purely by a shared secret that members
 //! obtain out of band (a passphrase, the hash of a photo, a QR code ...).
@@ -7,7 +7,7 @@
 //! ```text
 //! k_i      = Argon2id(source_i, salt = H(context, params))        one per source
 //! root     = H("root", context, params, n, sort(k_1 .. k_n))      order of sources is irrelevant
-//! room_id  = H("room-id", root)       routing key; reveals nothing about root
+//! room_id  = H("room-id", root)       routing key; permits offline guessing of weak roots
 //! auth     = H("auth", root)          bearer token; server stores only H("auth-verify", auth)
 //! epoch_0  = H("epoch0", root)
 //! ```
@@ -24,20 +24,21 @@
 //! chain_n+1  = H("chain-next", chain_n)
 //! ```
 //!
-//! Each message key is used once and the chain key is overwritten after use,
-//! so a device compromised *later* cannot decrypt messages it already
-//! processed (provided the root secret itself was not retained or leaked).
+//! Chain keys advance after each message, but retained epoch keys can
+//! regenerate every message key in their epoch.
 //! The ratchet state only advances after a message authenticates, so garbage
 //! cannot be used to burn keys. Plaintexts are padded to 256-byte blocks.
 //!
 //! ## What this does and does not give you
 //!
-//! * Forward secrecy against **state** compromise: yes.
+//! * State compromise exposes all retained epochs. Retiring an epoch helps
+//!   only if its key and any material that can reconstruct it are gone.
 //! * Against leak of the **root secret** (a stolen passphrase): no. Anyone
 //!   with the root and a recording of the traffic can derive epoch 0. That is
 //!   inherent to secret-derived rooms. Use [`Room::rekey`] to inject fresh
-//!   randomness wrapped to members' hybrid/ML-KEM keys: later epochs then stay
-//!   secret even if the root leaks (post-compromise security).
+//!   randomness wrapped to members' hybrid/ML-KEM keys. Recovery after a
+//!   compromise requires any compromised recipient/signing keys to be
+//!   rotated or excluded, and does not protect against a compromised endpoint.
 //! * Sender authenticity: optional ML-DSA signatures on envelopes and on
 //!   rekey bundles. Without signatures any holder of the root can impersonate
 //!   any sender id.
@@ -54,14 +55,14 @@
 //! The signature (if any) covers `"cipherbox-room-v1/msg-sig" || header || ct_len || ct`.
 
 use crate::keccak::sha3_256;
-use crate::{CipherboxError, Decapsulator};
+use crate::{CipherboxError, Decapsulator, Suite};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
-    ChaCha20Poly1305, Key, Nonce,
+    ChaCha20Poly1305, Key, Nonce, XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
 };
-use std::collections::BTreeMap;
-use zeroize::Zeroize;
+use std::collections::{BTreeMap, BTreeSet};
+use zeroize::{Zeroize, Zeroizing};
 
 const BASE: &str = "cipherbox-room-v1/";
 
@@ -84,6 +85,10 @@ const SIG_DOMAIN: &[u8] = b"cipherbox-room-v1/msg-sig";
 const REKEY_DOMAIN: &[u8] = b"cipherbox-room-v1/rekey-sig";
 const MAX_EPOCHS: usize = 4096;
 const MAX_REKEY_MEMBERS: usize = 1024;
+const STATE_MAGIC: &[u8; 5] = b"CBSX\x01";
+const STATE_NONCE_LEN: usize = 24;
+const MAX_STATE_BYTES: usize =
+    97 + 4 + MAX_EPOCHS * 36 + MAX_CHAINS * (60 + MAX_SKIP as usize * 36);
 
 fn err(msg: impl Into<String>) -> CipherboxError {
     CipherboxError::Crypto(msg.into())
@@ -160,6 +165,14 @@ impl Drop for RoomSecret {
 }
 
 impl RoomSecret {
+    /// Generate a high-entropy room root. Share it only over an authenticated,
+    /// confidential channel; anyone who learns it can derive the epoch-0 key.
+    pub fn generate() -> Result<Self, CipherboxError> {
+        let mut root = Zeroizing::new([0u8; 32]);
+        fill_random(&mut root[..])?;
+        Ok(Self::from_root(*root))
+    }
+
     /// Derive a room secret from 1..=16 non-empty sources. The order of
     /// `sources` does not matter. `context` (for example a server name or
     /// room label) separates unrelated rooms that share sources.
@@ -470,6 +483,28 @@ pub struct RekeyBundle {
 }
 
 impl RekeyBundle {
+    fn check_shape(&self) -> Result<(), CipherboxError> {
+        if self.entries.is_empty() || self.entries.len() > MAX_REKEY_MEMBERS {
+            return Err(err("invalid rekey entry count"));
+        }
+        if self.signature.is_empty() || self.signature.len() > MAX_SIG {
+            return Err(err("invalid rekey signature length"));
+        }
+        let mut recipients = BTreeSet::new();
+        for entry in &self.entries {
+            if !recipients.insert(entry.recipient_fingerprint) {
+                return Err(err("duplicate rekey recipient"));
+            }
+            if !valid_wrapped_seed_len(entry.wrapped.len())
+                || !entry.wrapped.starts_with(crate::WRAP_MAGIC)
+                || entry.wrapped[4] != crate::WRAP_VERSION
+            {
+                return Err(err("invalid wrapped rekey seed"));
+            }
+        }
+        Ok(())
+    }
+
     /// The exact bytes that must be signed / verified.
     pub fn signing_input(&self) -> Vec<u8> {
         let mut v = Vec::new();
@@ -514,15 +549,15 @@ impl RekeyBundle {
         let room_id = r.arr32()?;
         let epoch = r.u32()?;
         let n = r.u32()? as usize;
-        if n > MAX_REKEY_MEMBERS {
-            return Err(err("too many rekey entries"));
+        if !(1..=MAX_REKEY_MEMBERS).contains(&n) {
+            return Err(err("invalid rekey entry count"));
         }
         let mut entries = Vec::with_capacity(n);
         for _ in 0..n {
             let recipient_fingerprint = r.arr32()?;
             let len = r.u32()? as usize;
-            if len > 16 * 1024 {
-                return Err(err("rekey entry too large"));
+            if !valid_wrapped_seed_len(len) {
+                return Err(err("invalid wrapped rekey seed length"));
             }
             entries.push(RekeyEntry {
                 recipient_fingerprint,
@@ -530,18 +565,30 @@ impl RekeyBundle {
             });
         }
         let sig_len = r.u16()? as usize;
-        if sig_len > MAX_SIG {
-            return Err(err("rekey signature too large"));
+        if !(1..=MAX_SIG).contains(&sig_len) {
+            return Err(err("invalid rekey signature length"));
         }
         let signature = r.take(sig_len)?.to_vec();
         r.finish()?;
-        Ok(Self {
+        let bundle = Self {
             room_id,
             epoch,
             entries,
             signature,
-        })
+        };
+        bundle.check_shape()?;
+        Ok(bundle)
     }
+}
+
+fn valid_wrapped_seed_len(len: usize) -> bool {
+    Suite::ALL
+        .into_iter()
+        .any(|suite| len == wrapped_seed_len(suite))
+}
+
+fn wrapped_seed_len(suite: Suite) -> usize {
+    crate::WRAP_HEADER_BYTES + suite.ct_bytes() + 12 + 32 + TAG
 }
 
 // ============================================================================
@@ -612,6 +659,9 @@ pub struct Opened {
     /// Whether the envelope carried a signature (it was verified only if a
     /// verifier was passed to [`Room::open`]).
     pub signed: bool,
+    /// True only when the supplied signature verifier accepted the envelope.
+    /// Trust in the verifying key is the caller's responsibility.
+    pub signature_verified: bool,
 }
 
 /// One member's view of a room: epoch keys plus sending and receiving
@@ -646,6 +696,8 @@ impl Room {
         Ok(Self::join_with_sender_id(secret, sender))
     }
 
+    /// Advanced: the caller must never reuse a sender id under the same
+    /// epoch key. Prefer [`Self::join`] for normal operation.
     pub fn join_with_sender_id(secret: &RoomSecret, sender_id: [u8; 16]) -> Self {
         let mut k = secret.epoch0_key();
         let room = Self::from_keys(secret.room_id(), 0, k, sender_id);
@@ -654,7 +706,8 @@ impl Room {
     }
 
     /// Advanced / interoperability: build a room from raw values, starting at
-    /// `epoch` with the given epoch key.
+    /// `epoch` with the given epoch key. Never reuse an (epoch key, epoch,
+    /// sender id) tuple for sending.
     pub fn from_keys(
         room_id: [u8; 32],
         epoch: u32,
@@ -777,7 +830,33 @@ impl Room {
         envelope: &[u8],
         verify: Option<Verifier<'_>>,
     ) -> Result<Opened, CipherboxError> {
+        self.open_parsed(parse(envelope)?, verify)
+    }
+
+    /// Require both the expected sender id and its pinned ML-DSA-65/87 key.
+    /// Obtain this binding from a trusted roster, not the relay or envelope.
+    /// Do not fall back to [`Self::open`] without verification after failure.
+    pub fn open_from(
+        &mut self,
+        envelope: &[u8],
+        sender_id: &[u8; 16],
+        verifying_key: &[u8],
+    ) -> Result<Opened, CipherboxError> {
         let p = parse(envelope)?;
+        if &p.sender != sender_id {
+            return Err(err("unexpected sender id"));
+        }
+        self.open_parsed(
+            p,
+            Some(&|msg, sig| crate::ml_dsa_verify(verifying_key, msg, sig)),
+        )
+    }
+
+    fn open_parsed(
+        &mut self,
+        p: Parsed<'_>,
+        verify: Option<Verifier<'_>>,
+    ) -> Result<Opened, CipherboxError> {
         if p.room_id != self.room_id {
             return Err(err("envelope belongs to a different room"));
         }
@@ -835,6 +914,7 @@ impl Room {
             epoch: p.epoch,
             index: p.index,
             signed,
+            signature_verified: verify.is_some(),
         })
     }
 
@@ -866,25 +946,20 @@ impl Room {
         }
 
         // Wrap first so a bad member key leaves the room state untouched.
-        let mut seed = [0u8; 32];
-        fill_random(&mut seed)?;
+        let mut seed = Zeroizing::new([0u8; 32]);
+        fill_random(&mut seed[..])?;
         let mut entries = Vec::with_capacity(member_public_keys.len());
+        let mut recipients = BTreeSet::new();
         for pk in member_public_keys {
-            match crate::wrap_key(pk, &seed) {
-                Ok(wrapped) => entries.push(RekeyEntry {
-                    recipient_fingerprint: public_key_fingerprint(pk),
-                    wrapped,
-                }),
-                Err(e) => {
-                    seed.zeroize();
-                    return Err(e);
-                }
+            let fingerprint = public_key_fingerprint(pk);
+            if !recipients.insert(fingerprint) {
+                return Err(err("duplicate rekey recipient"));
             }
+            entries.push(RekeyEntry {
+                recipient_fingerprint: fingerprint,
+                wrapped: crate::wrap_key(pk, &seed[..])?,
+            });
         }
-
-        let old = self.epoch_keys[&self.current_epoch];
-        let new_key = next_epoch_key(&old, &seed, new_epoch);
-        seed.zeroize();
 
         let mut bundle = RekeyBundle {
             room_id: self.room_id,
@@ -898,13 +973,14 @@ impl Room {
         }
         bundle.signature = sig;
 
+        let new_key = next_epoch_key(&self.epoch_keys[&self.current_epoch], &seed, new_epoch);
         self.install_epoch(new_epoch, new_key);
         Ok(bundle)
     }
 
     /// Apply a rekey bundle announced by another member. `verify` must check
-    /// `signature` over `bundle.signing_input()` against a member you trust;
-    /// it is called before anything else happens. The bundle's epoch must be
+    /// `signature` over `bundle.signing_input()` against an authorized rekey
+    /// signer. It is called before decapsulation or any state change. The bundle's epoch must be
     /// exactly one more than the newest epoch you know.
     pub fn apply_rekey<K: Decapsulator + ?Sized>(
         &mut self,
@@ -915,39 +991,36 @@ impl Room {
         if bundle.room_id != self.room_id {
             return Err(err("rekey bundle belongs to a different room"));
         }
-        if !verify(&bundle.signing_input(), &bundle.signature) {
-            return Err(err("rekey signature verification failed"));
-        }
-        let latest = *self
-            .epoch_keys
-            .keys()
-            .next_back()
-            .ok_or_else(|| err("room has no epoch keys"))?;
+        let latest = self.current_epoch;
         if latest.checked_add(1) != Some(bundle.epoch) {
             return Err(err(format!(
                 "rekey epoch {} is not the next epoch after {latest}",
                 bundle.epoch
             )));
         }
+        if self.epoch_keys.len() >= MAX_EPOCHS {
+            return Err(err("too many epochs retained: call forget_epochs_before"));
+        }
+        bundle.check_shape()?;
         let fp = public_key_fingerprint(my_key.public_key_bytes());
         let entry = bundle
             .entries
             .iter()
             .find(|e| e.recipient_fingerprint == fp)
             .ok_or_else(|| err("rekey bundle has no entry for this key"))?;
-
-        let mut seed_v = crate::unwrap_key(my_key, &entry.wrapped)?;
-        if seed_v.len() != 32 {
-            seed_v.zeroize();
-            return Err(err("rekey seed has the wrong length"));
+        if entry.wrapped.len() != wrapped_seed_len(my_key.suite()) {
+            return Err(err("wrapped rekey seed does not match recipient suite"));
         }
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&seed_v);
-        seed_v.zeroize();
+        if !verify(&bundle.signing_input(), &bundle.signature) {
+            return Err(err("rekey signature verification failed"));
+        }
 
-        let old = self.epoch_keys[&latest];
-        let new_key = next_epoch_key(&old, &seed, bundle.epoch);
-        seed.zeroize();
+        let seed_v = Zeroizing::new(crate::unwrap_key(my_key, &entry.wrapped)?);
+        let seed: &[u8; 32] = seed_v
+            .as_slice()
+            .try_into()
+            .map_err(|_| err("rekey seed has the wrong length"))?;
+        let new_key = next_epoch_key(&self.epoch_keys[&latest], seed, bundle.epoch);
         self.install_epoch(bundle.epoch, new_key);
         Ok(())
     }
@@ -961,8 +1034,8 @@ impl Room {
     }
 
     /// Delete keys and chains of epochs older than `epoch` (never the current
-    /// one). Messages of those epochs can no longer be decrypted: this is what
-    /// makes old epochs forward-secret.
+    /// one). This instance can no longer decrypt those epochs. Retaining the
+    /// root, old snapshots, or recoverable rekey material can defeat erasure.
     pub fn forget_epochs_before(&mut self, epoch: u32) {
         let keep_from = epoch.min(self.current_epoch);
         let old: Vec<u32> = self
@@ -981,8 +1054,84 @@ impl Room {
 
     // ---------------- persistence ----------------
 
-    /// Serialize the full ratchet state (secret!). Encrypt it before storing,
-    /// for example with `encrypt_private_key`.
+    /// Encrypt the ratchet snapshot with a separately stored, random 32-byte
+    /// device storage key. The snapshot is authenticated to this room id.
+    pub fn export_encrypted_state(&self, device_key: &[u8; 32]) -> Result<Vec<u8>, CipherboxError> {
+        let mut nonce = [0u8; STATE_NONCE_LEN];
+        fill_random(&mut nonce)?;
+        let state = Zeroizing::new(self.export_state());
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(device_key));
+        let ct = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &state,
+                    aad: &state_aad(&self.room_id),
+                },
+            )
+            .map_err(|_| err("could not encrypt room state"))?;
+        let mut out = Vec::with_capacity(STATE_MAGIC.len() + nonce.len() + ct.len());
+        out.extend_from_slice(STATE_MAGIC);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    /// Restore authenticated state and rotate to a fresh sending id, so
+    /// restoring the same snapshot repeatedly cannot restart the old send
+    /// chain. Authenticate the new sender binding before sending to peers.
+    /// The caller must also prevent storage rollback to protect replay history
+    /// and reject snapshots from an obsolete epoch.
+    pub fn restore_encrypted_state(
+        bytes: &[u8],
+        device_key: &[u8; 32],
+        expected_room_id: &[u8; 32],
+        minimum_epoch: u32,
+    ) -> Result<Self, CipherboxError> {
+        let header_len = STATE_MAGIC.len() + STATE_NONCE_LEN;
+        if bytes.len() < header_len + TAG
+            || bytes.len() > header_len + TAG + MAX_STATE_BYTES
+            || !bytes.starts_with(STATE_MAGIC)
+        {
+            return Err(err("invalid encrypted room state framing"));
+        }
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(device_key));
+        let plain = Zeroizing::new(
+            cipher
+                .decrypt(
+                    XNonce::from_slice(&bytes[STATE_MAGIC.len()..header_len]),
+                    Payload {
+                        msg: &bytes[header_len..],
+                        aad: &state_aad(expected_room_id),
+                    },
+                )
+                .map_err(|_| err("room state failed to authenticate"))?,
+        );
+        let mut state = Self::import_state(&plain)?;
+        if &state.room_id != expected_room_id || state.current_epoch < minimum_epoch {
+            return Err(err("room state does not match the trusted room or epoch"));
+        }
+        let mut sender_id = [0u8; 16];
+        loop {
+            fill_random(&mut sender_id)?;
+            if sender_id != state.sender_id
+                && !state.recv.contains_key(&(state.current_epoch, sender_id))
+            {
+                break;
+            }
+        }
+        state.sender_id = sender_id;
+        state.send_index = 0;
+        state.send_key = chain0(
+            &state.epoch_keys[&state.current_epoch],
+            &sender_id,
+            state.current_epoch,
+        );
+        Ok(state)
+    }
+
+    /// Legacy raw secret snapshot. Prefer [`Self::export_encrypted_state`].
+    /// This byte string must never be stored or transmitted in plaintext.
     pub fn export_state(&self) -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(b"CBRS");
@@ -1012,7 +1161,13 @@ impl Room {
         v
     }
 
+    /// Legacy API for trusted, authenticated current snapshots only. Resuming
+    /// a stale or concurrently used snapshot can reuse message keys/nonces.
+    /// Prefer [`Self::restore_encrypted_state`].
     pub fn import_state(bytes: &[u8]) -> Result<Self, CipherboxError> {
+        if bytes.len() > MAX_STATE_BYTES {
+            return Err(err("room state too large"));
+        }
         let mut r = Reader::new(bytes);
         if r.take(4)? != b"CBRS" {
             return Err(err("bad room state magic"));
@@ -1024,18 +1179,29 @@ impl Room {
         let sender_id = r.arr16()?;
         let current_epoch = r.u32()?;
         let send_index = r.u32()?;
-        let send_key = r.arr32()?;
+        let send_key = Zeroizing::new(r.arr32()?);
 
         let n_epochs = r.u32()? as usize;
         if n_epochs == 0 || n_epochs > MAX_EPOCHS {
             return Err(err("invalid epoch count"));
         }
-        let mut epoch_keys = BTreeMap::new();
+        let mut room = Self {
+            room_id,
+            sender_id,
+            current_epoch,
+            epoch_keys: BTreeMap::new(),
+            send_index,
+            send_key: *send_key,
+            recv: BTreeMap::new(),
+        };
         for _ in 0..n_epochs {
             let e = r.u32()?;
-            epoch_keys.insert(e, r.arr32()?);
+            if e > current_epoch || room.epoch_keys.contains_key(&e) {
+                return Err(err("invalid or duplicate epoch in state"));
+            }
+            room.epoch_keys.insert(e, r.arr32()?);
         }
-        if !epoch_keys.contains_key(&current_epoch) {
+        if !room.epoch_keys.contains_key(&current_epoch) {
             return Err(err("current epoch key missing from state"));
         }
 
@@ -1043,33 +1209,43 @@ impl Room {
         if n_chains > MAX_CHAINS {
             return Err(err("too many chains in state"));
         }
-        let mut recv = BTreeMap::new();
         for _ in 0..n_chains {
             let e = r.u32()?;
             let sender = r.arr16()?;
+            if sender == sender_id
+                || !room.epoch_keys.contains_key(&e)
+                || room.recv.contains_key(&(e, sender))
+            {
+                return Err(err("invalid or duplicate receive chain in state"));
+            }
             let next = r.u32()?;
-            let key = r.arr32()?;
+            let mut chain = RecvChain {
+                next,
+                key: r.arr32()?,
+                skipped: BTreeMap::new(),
+            };
             let n_skipped = r.u32()? as usize;
             if n_skipped > MAX_SKIP as usize {
                 return Err(err("too many skipped keys in state"));
             }
-            let mut skipped = BTreeMap::new();
             for _ in 0..n_skipped {
                 let i = r.u32()?;
-                skipped.insert(i, r.arr32()?);
+                if i >= next || chain.skipped.contains_key(&i) {
+                    return Err(err("invalid or duplicate skipped key index"));
+                }
+                chain.skipped.insert(i, r.arr32()?);
             }
-            recv.insert((e, sender), RecvChain { next, key, skipped });
+            room.recv.insert((e, sender), chain);
         }
         r.finish()?;
 
-        Ok(Self {
-            room_id,
-            sender_id,
-            current_epoch,
-            epoch_keys,
-            send_index,
-            send_key,
-            recv,
-        })
+        Ok(room)
     }
+}
+
+fn state_aad(room_id: &[u8; 32]) -> [u8; 37] {
+    let mut aad = [0u8; 37];
+    aad[..STATE_MAGIC.len()].copy_from_slice(STATE_MAGIC);
+    aad[STATE_MAGIC.len()..].copy_from_slice(room_id);
+    aad
 }
